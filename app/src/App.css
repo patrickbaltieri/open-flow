@@ -262,6 +262,68 @@ button.danger:hover {
   color: var(--text);
 }
 
+.hotkey-input {
+  position: relative;
+}
+
+.hotkey-input input {
+  padding-right: 2.2rem;
+  cursor: pointer;
+  font-variant-caps: all-small-caps;
+  letter-spacing: 0.03em;
+}
+
+.hotkey-input input:focus {
+  border-color: var(--text);
+}
+
+.hotkey-input input::placeholder {
+  font-variant-caps: normal;
+  letter-spacing: normal;
+  color: var(--muted);
+}
+
+.hotkey-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: none;
+  border: none;
+  padding: 0.1rem 0.4rem;
+  color: var(--muted);
+  line-height: 1;
+  font-size: 1.1rem;
+}
+
+.hotkey-clear:hover {
+  background: none;
+  color: var(--text);
+}
+
+.profile-hotkey {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.profile-hotkey > span {
+  font-size: 0.8rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.profile-hotkey .hotkey-input {
+  flex: 1;
+  max-width: 200px;
+}
+
+.profile-hotkey select {
+  width: auto;
+  font-size: 0.85rem;
+}
+
 .switch-row {
   display: flex;
   align-items: center;

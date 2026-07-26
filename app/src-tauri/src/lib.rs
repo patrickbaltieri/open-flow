@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -20,9 +21,14 @@ Regras invioláveis:\n\
 3. Corrija concordância e pontuação. NÃO adicione fatos, NÃO resuma, NÃO omita conteúdo.\n";
 
 #[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
 struct Profile {
     name: String,
     style: String,
+    /// atalho próprio: dita já no estilo deste perfil, sem trocar o perfil ativo
+    hotkey: String,
+    /// "hold" (padrão) ou "toggle"
+    hotkey_mode: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -34,7 +40,13 @@ struct Snippet {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct Settings {
+    /// atalho de ditado no modo "segurar e falar"
     hotkey: String,
+    /// atalho de ditado no modo "apertar para iniciar, apertar para parar"
+    hotkey_toggle: String,
+    /// atalho que avança para o próximo perfil da lista
+    hotkey_cycle_profile: String,
+    /// legado: antes escolhia o modo do atalho único. Só é lido na migração.
     mode: String,
     mic: Option<String>,
     stt_provider: String,
@@ -57,7 +69,12 @@ struct Settings {
 }
 
 fn default_profiles() -> Vec<Profile> {
-    let p = |name: &str, style: &str| Profile { name: name.into(), style: style.into() };
+    let p = |name: &str, style: &str| Profile {
+        name: name.into(),
+        style: style.into(),
+        hotkey: String::new(),
+        hotkey_mode: "hold".into(),
+    };
     vec![
         p("Bruto corrigido", "texto natural corrigido, mantendo o tom do falante."),
         p("Jurídico formal", "certidão ou comunicação de oficial de justiça, linguagem jurídica formal brasileira (ex.: \"Certifico e dou fé que...\", \"genitor\", \"Ante o exposto, devolvo o presente mandado\")."),
@@ -102,6 +119,8 @@ impl Default for Settings {
         let (python, sidecar) = default_sidecar_paths();
         Settings {
             hotkey: default_hotkey(),
+            hotkey_toggle: String::new(),
+            hotkey_cycle_profile: String::new(),
             mode: "hold".into(),
             mic: None,
             stt_provider: "groq".into(),
@@ -128,9 +147,11 @@ impl Default for Settings {
 
 struct Shared {
     settings: Mutex<Settings>,
-    groups: Mutex<Vec<Vec<u32>>>,
+    bindings: Mutex<Vec<Binding>>,
     sidecar: Mutex<Option<std::process::Child>>,
     insert_lock: Mutex<()>,
+    /// preenchido no setup(); o hook de teclado precisa dele para trocar perfil e avisar na tela
+    app: OnceLock<AppHandle>,
 }
 
 impl Settings {
@@ -197,6 +218,17 @@ fn load_settings() -> (Settings, bool) {
                 if s.profiles.is_empty() {
                     s.profiles = default_profiles();
                 }
+                // versões antigas tinham um atalho só, com o modo num campo à parte:
+                // quem estava em "toggle" mantém o comportamento no atalho equivalente
+                if s.mode == "toggle" && s.hotkey_toggle.is_empty() && !s.hotkey.is_empty() {
+                    s.hotkey_toggle = std::mem::take(&mut s.hotkey);
+                }
+                s.mode = "hold".into();
+                for p in &mut s.profiles {
+                    if p.hotkey_mode.is_empty() {
+                        p.hotkey_mode = "hold".into();
+                    }
+                }
                 s.gemini_api_key = decrypt_key("gemini_api_key", &s.gemini_api_key);
                 s.groq_api_key = decrypt_key("groq_api_key", &s.groq_api_key);
                 return (s, false);
@@ -215,14 +247,71 @@ fn load_settings() -> (Settings, bool) {
 }
 
 /// keycodes por plataforma (VK no Windows, CGKeyCode no mac) vêm de platform::
-fn parse_hotkey(s: &str) -> Vec<Vec<u32>> {
-    s.split('+')
-        .map(|t| {
-            let name = t.trim().to_uppercase();
-            platform::modifier_group(&name)
-                .unwrap_or_else(|| vec![platform::key_from_name(&name)])
-        })
-        .collect()
+/// Cada elemento é um grupo: basta uma das teclas do grupo (ex.: Ctrl esquerdo ou direito).
+/// `None` quando o texto está vazio ou cita uma tecla desconhecida — atalho inválido é
+/// ignorado, nunca vira uma tecla arbitrária.
+fn parse_hotkey(s: &str) -> Option<Vec<Vec<u32>>> {
+    let mut groups = Vec::new();
+    for token in s.split('+') {
+        let name = token.trim().to_uppercase();
+        if name.is_empty() {
+            return None;
+        }
+        let group = platform::modifier_group(&name)
+            .or_else(|| platform::key_from_name(&name).map(|k| vec![k]))?;
+        groups.push(group);
+    }
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
+}
+
+/// O que um atalho faz quando disparado.
+#[derive(Clone)]
+enum Act {
+    /// grava e dita; `profile` força o estilo daquele perfil sem mudar o perfil ativo
+    Record { toggle: bool, profile: Option<String> },
+    /// avança para o próximo perfil da lista
+    CycleProfile,
+}
+
+#[derive(Clone)]
+struct Binding {
+    /// identidade estável do vínculo ("hold", "toggle", "cycle", "profile:<nome>")
+    id: String,
+    groups: Vec<Vec<u32>>,
+    act: Act,
+}
+
+fn add_binding(v: &mut Vec<Binding>, id: String, keys: &str, act: Act) {
+    if let Some(groups) = parse_hotkey(keys) {
+        // um mesmo atalho em dois lugares: vale o primeiro cadastrado
+        if v.iter().any(|b| b.groups == groups) {
+            eprintln!("[hotkey] atalho duplicado ignorado em {id}: {keys}");
+            return;
+        }
+        v.push(Binding { id, groups, act });
+    }
+}
+
+fn build_bindings(s: &Settings) -> Vec<Binding> {
+    let mut v = Vec::new();
+    add_binding(&mut v, "hold".into(), &s.hotkey, Act::Record { toggle: false, profile: None });
+    add_binding(&mut v, "toggle".into(), &s.hotkey_toggle, Act::Record { toggle: true, profile: None });
+    add_binding(&mut v, "cycle".into(), &s.hotkey_cycle_profile, Act::CycleProfile);
+    for p in &s.profiles {
+        add_binding(
+            &mut v,
+            format!("profile:{}", p.name),
+            &p.hotkey,
+            Act::Record { toggle: p.hotkey_mode == "toggle", profile: Some(p.name.clone()) },
+        );
+    }
+    // mais teclas = mais específico. Sem isto, Ctrl+Win dispararia junto com Ctrl+Win+J.
+    v.sort_by(|a, b| b.groups.len().cmp(&a.groups.len()));
+    v
 }
 
 type LevelFn = Box<dyn FnMut(f32) + Send>;
@@ -447,11 +536,11 @@ fn transcribe(wav: Vec<u8>, port: u16, lang: &str) -> Result<String, String> {
     Ok(v["text"].as_str().unwrap_or("").trim().to_string())
 }
 
-fn build_prompt(s: &Settings) -> String {
+fn build_prompt(s: &Settings, profile: &str) -> String {
     let style = s
         .profiles
         .iter()
-        .find(|p| p.name == s.active_profile)
+        .find(|p| p.name == profile)
         .map(|p| p.style.clone())
         .unwrap_or_else(|| "texto natural corrigido, mantendo o tom do falante.".into());
     let mut p = RULES.to_string();
@@ -475,7 +564,7 @@ fn build_prompt(s: &Settings) -> String {
     p
 }
 
-fn rewrite(raw: &str, s: &Settings) -> Result<String, String> {
+fn rewrite(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
     let key = s
         .gemini_api_key
         .clone()
@@ -491,7 +580,7 @@ fn rewrite(raw: &str, s: &Settings) -> Result<String, String> {
         s.gemini_model, key
     );
     let body = serde_json::json!({
-        "contents": [{"parts": [{"text": format!("{}{}", build_prompt(s), raw)}]}],
+        "contents": [{"parts": [{"text": format!("{}{}", build_prompt(s, profile), raw)}]}],
         "generationConfig": {"temperature": 0.2}
     });
     let v: serde_json::Value = client
@@ -608,8 +697,66 @@ fn overlay_hide(app: &AppHandle) {
     }
 }
 
+/// cada toast recebe um número; só o mais recente pode se apagar sozinho
+static TOAST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// balão discreto acima do overlay, dizendo qual perfil está em uso
+fn toast_show(app: &AppHandle, text: &str) {
+    let Some(w) = app.get_webview_window("toast") else {
+        overlay_log("janela toast inexistente");
+        return;
+    };
+    let mon = w
+        .cursor_position()
+        .ok()
+        .and_then(|p| w.monitor_from_point(p.x, p.y).ok().flatten())
+        .or_else(|| w.primary_monitor().ok().flatten());
+    if let (Some(mon), Ok(sz)) = (mon, w.outer_size()) {
+        let m = mon.size();
+        let x = mon.position().x + (m.width as i32 - sz.width as i32) / 2;
+        // acima do overlay das ondas, para os dois poderem aparecer juntos
+        let y = mon.position().y + m.height as i32 - sz.height as i32 - 128;
+        let _ = w.set_position(PhysicalPosition::new(x, y));
+    }
+    let _ = w.set_always_on_top(true);
+    let _ = w.show();
+    let _ = app.emit_to("toast", "toast", text.to_string());
+
+    let seq = TOAST_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1600));
+        if TOAST_SEQ.load(Ordering::SeqCst) == seq {
+            if let Some(w) = app.get_webview_window("toast") {
+                let _ = w.hide();
+            }
+        }
+    });
+}
+
+/// avança o perfil ativo e avisa na tela
+fn cycle_profile(shared: &Arc<Shared>) {
+    let s = {
+        let mut g = shared.settings.lock().unwrap();
+        if g.profiles.is_empty() {
+            return;
+        }
+        let i = g.profiles.iter().position(|p| p.name == g.active_profile).unwrap_or(0);
+        g.active_profile = g.profiles[(i + 1) % g.profiles.len()].name.clone();
+        g.clone()
+    };
+    let _ = persist_settings(&s);
+    println!("[hotkey] perfil ativo: {}", s.active_profile);
+    if let Some(app) = shared.app.get() {
+        rebuild_tray_menu(app, &s);
+        let _ = app.emit("settings_changed", ());
+        toast_show(app, &s.active_profile);
+    }
+}
+
 enum Cmd {
-    Start,
+    /// `Some(perfil)` dita naquele estilo sem mexer no perfil ativo
+    Start(Option<String>),
     Stop,
 }
 
@@ -617,9 +764,12 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
     let (tx, rx) = channel::<Cmd>();
     std::thread::spawn(move || {
         let mut rec = Recorder::new();
+        // perfil pedido pelo atalho que iniciou a gravação em curso
+        let mut pending_profile: Option<String> = None;
         loop {
             match rx.recv() {
-                Ok(Cmd::Start) => {
+                Ok(Cmd::Start(profile)) => {
+                    pending_profile = profile;
                     overlay_show(&app);
                     let mic = shared.settings.lock().unwrap().mic.clone();
                     let app_lvl = app.clone();
@@ -639,6 +789,7 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                 }
                 Ok(Cmd::Stop) => {
                     overlay_hide(&app);
+                    let forced_profile = pending_profile.take();
                     let (samples, rate) = rec.stop();
                     let secs = samples.len() as f32 / rate as f32;
                     if secs < 0.4 {
@@ -653,6 +804,7 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                     // processamento em thread própria: a thread do atalho fica livre e o
                     // próximo Start é imediato (overlay e gravação sem atraso de fila)
                     let s = shared.settings.lock().unwrap().clone();
+                    let profile = forced_profile.unwrap_or_else(|| s.active_profile.clone());
                     let shared_w = shared.clone();
                     std::thread::spawn(move || {
                         let t0 = Instant::now();
@@ -665,7 +817,7 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                                     return Err(format!("alucinação de silêncio descartada: {raw:?}"));
                                 }
                                 let t_stt = t0.elapsed().as_secs_f32();
-                                let final_text = match rewrite(&raw, &s) {
+                                let final_text = match rewrite(&raw, &s, &profile) {
                                     Ok(t) => t,
                                     Err(e) => {
                                         eprintln!("[pipeline] reescrita falhou ({e}); usando texto bruto");
@@ -678,7 +830,7 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                                 if s.history_enabled {
                                     append_history(&HistoryEntry {
                                         ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                                        profile: s.active_profile.clone(),
+                                        profile: profile.clone(),
                                         raw,
                                         r#final: final_text.clone(),
                                         audio_secs: secs,
@@ -707,8 +859,14 @@ struct HookState {
     shared: Arc<Shared>,
     tx: Sender<Cmd>,
     pressed: HashSet<u32>,
-    active: bool,
-    recording: bool,
+    /// atalho fisicamente pressionado agora — enquanto existe, os outros são ignorados
+    latched: Option<String>,
+    /// atalho que iniciou a gravação em curso (só ele pode encerrá-la)
+    recording: Option<String>,
+}
+
+fn binding_satisfied(b: &Binding, pressed: &HashSet<u32>) -> bool {
+    !b.groups.is_empty() && b.groups.iter().all(|g| g.iter().any(|k| pressed.contains(k)))
 }
 
 fn handle_key(st: &mut HookState, vk: u32, down: bool) {
@@ -717,26 +875,71 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
     } else {
         st.pressed.remove(&vk);
     }
-    let groups = st.shared.groups.lock().unwrap();
-    let satisfied =
-        !groups.is_empty() && groups.iter().all(|g| g.iter().any(|k| st.pressed.contains(k)));
-    drop(groups);
-    let mode = st.shared.settings.lock().unwrap().mode.clone();
-    if satisfied && !st.active {
-        st.active = true;
-        println!("[hotkey] atalho ativado");
-        if mode == "toggle" {
-            st.recording = !st.recording;
-            let _ = st.tx.send(if st.recording { Cmd::Start } else { Cmd::Stop });
-        } else {
-            st.recording = true;
-            let _ = st.tx.send(Cmd::Start);
+
+    enum Step {
+        Nothing,
+        /// o atalho pressionado foi solto; `hold` diz se isso encerra a gravação
+        Release { hold: bool },
+        Fire { id: String, act: Act },
+    }
+
+    // decide com o cadeado dos vínculos na mão e age depois de soltá-lo:
+    // agir aqui dentro travaria junto com o cadeado das configurações
+    let step = {
+        let bindings = st.shared.bindings.lock().unwrap();
+        match &st.latched {
+            Some(id) => match bindings.iter().find(|b| &b.id == id) {
+                Some(b) if binding_satisfied(b, &st.pressed) => Step::Nothing,
+                Some(b) => Step::Release {
+                    hold: matches!(b.act, Act::Record { toggle: false, .. }),
+                },
+                // o atalho sumiu (configuração mudou no meio): encerra o que estiver aberto
+                None => Step::Release { hold: true },
+            },
+            // a lista vem do mais específico para o mais genérico
+            None => match bindings.iter().find(|b| binding_satisfied(b, &st.pressed)) {
+                Some(b) => Step::Fire { id: b.id.clone(), act: b.act.clone() },
+                None => Step::Nothing,
+            },
         }
-    } else if !satisfied && st.active {
-        st.active = false;
-        if mode != "toggle" && st.recording {
-            st.recording = false;
-            let _ = st.tx.send(Cmd::Stop);
+    };
+
+    match step {
+        Step::Nothing => {}
+        Step::Release { hold } => {
+            let id = st.latched.take();
+            if hold && st.recording == id {
+                st.recording = None;
+                let _ = st.tx.send(Cmd::Stop);
+            }
+        }
+        Step::Fire { id, act } => {
+            st.latched = Some(id.clone());
+            match act {
+                // fora da thread do hook: o WH_KEYBOARD_LL é removido pelo Windows se o
+                // callback demorar, e isto grava arquivo e mexe em janela
+                Act::CycleProfile => {
+                    let shared = st.shared.clone();
+                    std::thread::spawn(move || cycle_profile(&shared));
+                }
+                Act::Record { toggle, profile } => {
+                    if st.recording.is_some() {
+                        // gravando: só o mesmo atalho, em modo apertar/parar, encerra
+                        if st.recording.as_deref() == Some(id.as_str()) && toggle {
+                            st.recording = None;
+                            let _ = st.tx.send(Cmd::Stop);
+                        }
+                        return;
+                    }
+                    println!("[hotkey] {id} ativado");
+                    if let (Some(p), Some(app)) = (profile.clone(), st.shared.app.get()) {
+                        let app = app.clone();
+                        std::thread::spawn(move || toast_show(&app, &p));
+                    }
+                    st.recording = Some(id);
+                    let _ = st.tx.send(Cmd::Start(profile));
+                }
+            }
         }
     }
 }
@@ -770,7 +973,7 @@ fn save_settings(
     settings: Settings,
 ) -> Result<(), String> {
     persist_settings(&settings)?;
-    *state.groups.lock().unwrap() = parse_hotkey(&settings.hotkey);
+    *state.bindings.lock().unwrap() = build_bindings(&settings);
     let warm_local = settings.stt_provider == "local";
     rebuild_tray_menu(&app, &settings);
     *state.settings.lock().unwrap() = settings;
@@ -898,10 +1101,11 @@ pub fn run() {
     // com Groq configurado como provedor, a GPU fica livre: o local só aquece sob demanda
     let start_local = settings.stt_provider != "groq" || !settings.groq_ready();
     let shared = Arc::new(Shared {
-        groups: Mutex::new(parse_hotkey(&settings.hotkey)),
+        bindings: Mutex::new(build_bindings(&settings)),
         sidecar: Mutex::new(if start_local { platform::spawn_sidecar(&settings) } else { None }),
         settings: Mutex::new(settings.clone()),
         insert_lock: Mutex::new(()),
+        app: OnceLock::new(),
     });
 
     let shared_exit = shared.clone();
@@ -956,6 +1160,8 @@ pub fn run() {
                 use tauri_plugin_autostart::ManagerExt;
                 let _ = app.autolaunch().enable();
             }
+            // o hook de teclado troca perfil e mostra o balão: precisa do handle
+            let _ = shared_setup.app.set(app.handle().clone());
             let tx = spawn_pipeline(shared_setup.clone(), app.handle().clone());
             platform::spawn_hotkey_listener(shared_setup.clone(), tx);
 

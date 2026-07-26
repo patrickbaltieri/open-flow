@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Overlay from "./Overlay";
+import Toast from "./Toast";
 import canalImg from "./assets/canal.png";
 import pixQrImg from "./assets/pix-qr.png";
 import "./App.css";
@@ -12,6 +13,8 @@ const isMac = navigator.userAgent.includes("Mac");
 export interface Profile {
   name: string;
   style: string;
+  hotkey: string;
+  hotkey_mode: string;
 }
 
 export interface Snippet {
@@ -21,6 +24,8 @@ export interface Snippet {
 
 export interface Settings {
   hotkey: string;
+  hotkey_toggle: string;
+  hotkey_cycle_profile: string;
   mode: string;
   mic: string | null;
   stt_provider: string;
@@ -67,9 +72,12 @@ const TABS = ["Geral", "Insights", "Perfis", "Dicionário", "Snippets", "Histór
 type Tab = (typeof TABS)[number];
 
 function App() {
-  const isOverlay = new URLSearchParams(window.location.search).has("overlay");
-  if (isOverlay) {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has("overlay")) {
     return <Overlay />;
+  }
+  if (params.has("toast")) {
+    return <Toast />;
   }
   return <SettingsApp />;
 }
@@ -203,6 +211,120 @@ function SecretInput({
   );
 }
 
+const MODS = isMac
+  ? { ctrl: "Ctrl", alt: "Option", shift: "Shift", meta: "Cmd" }
+  : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", meta: "Win" };
+
+/// nomes aceitos pelo Rust (platform::key_from_name)
+function mainKeyName(code: string): string | null {
+  if (/^Key[A-Z]$/.test(code)) {
+    return code.slice(3);
+  }
+  if (/^Digit[0-9]$/.test(code)) {
+    return code.slice(5);
+  }
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) {
+    return code;
+  }
+  if (/^Numpad[0-9]$/.test(code)) {
+    return `NUMPAD${code.slice(6)}`;
+  }
+  const named: Record<string, string> = {
+    Space: "SPACE", Enter: "ENTER", NumpadEnter: "ENTER", Tab: "TAB", Escape: "ESC",
+    Backspace: "BACKSPACE", Delete: "DELETE", Insert: "INSERT", Home: "HOME", End: "END",
+    PageUp: "PAGEUP", PageDown: "PAGEDOWN", ArrowUp: "UP", ArrowDown: "DOWN",
+    ArrowLeft: "LEFT", ArrowRight: "RIGHT", CapsLock: "CAPSLOCK", ScrollLock: "SCROLLLOCK",
+    Pause: "PAUSE", NumLock: "NUMLOCK",
+  };
+  return named[code] ?? null;
+}
+
+/// Campo que grava a combinação teclada. Combos só de modificadores (Ctrl+Win)
+/// são fechados ao soltar; com tecla comum, no próprio keydown.
+function HotkeyInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+}) {
+  const [capturing, setCapturing] = useState(false);
+  const [pending, setPending] = useState<string[]>([]);
+  const pendingRef = useRef<string[]>([]);
+  const doneRef = useRef(false);
+
+  const setP = (v: string[]) => {
+    pendingRef.current = v;
+    setPending(v);
+  };
+
+  const modsOf = (e: React.KeyboardEvent) => {
+    const out: string[] = [];
+    if (e.ctrlKey) out.push(MODS.ctrl);
+    if (e.altKey) out.push(MODS.alt);
+    if (e.shiftKey) out.push(MODS.shift);
+    if (e.metaKey) out.push(MODS.meta);
+    return out;
+  };
+
+  const commit = (combo: string, el: HTMLInputElement) => {
+    doneRef.current = true;
+    onChange(combo);
+    el.blur();
+  };
+
+  return (
+    <div className="hotkey-input">
+      <input
+        readOnly
+        value={capturing ? pending.join("+") : value}
+        placeholder={capturing ? "tecle a combinação..." : (placeholder ?? "sem atalho")}
+        onFocus={() => {
+          setCapturing(true);
+          setP([]);
+          doneRef.current = false;
+        }}
+        onBlur={() => {
+          setCapturing(false);
+          setP([]);
+        }}
+        onKeyDown={(e) => {
+          e.preventDefault();
+          const el = e.target as HTMLInputElement;
+          const mods = modsOf(e);
+          // Esc sozinho desiste da captura; com modificador, é atalho válido
+          if (e.code === "Escape" && mods.length === 0) {
+            el.blur();
+            return;
+          }
+          setP(mods);
+          const main = mainKeyName(e.code);
+          if (main) {
+            commit([...mods, main].join("+"), el);
+          }
+        }}
+        onKeyUp={(e) => {
+          if (doneRef.current) {
+            return;
+          }
+          const held = modsOf(e);
+          // último modificador solto: fecha o combo com o que estava pressionado
+          if (held.length === 0 && pendingRef.current.length > 0) {
+            commit(pendingRef.current.join("+"), e.target as HTMLInputElement);
+          }
+        }}
+      />
+      {value && !capturing && (
+        <button type="button" className="hotkey-clear" title="Remover atalho" onClick={() => onChange("")}>
+          ×
+        </button>
+      )}
+    </div>
+  );
+}
+
 function GeneralTab({ s, patch }: TabProps) {
   const [mics, setMics] = useState<string[]>([]);
   const [autostart, setAutostart] = useState(false);
@@ -215,24 +337,30 @@ function GeneralTab({ s, patch }: TabProps) {
     <section>
       <h1>Geral</h1>
       <label className="field">
-        <span>Atalho global</span>
-        <input
-          list="hotkeys"
-          value={s.hotkey}
-          onChange={(e) => patch({ hotkey: e.target.value })}
-        />
-        <datalist id="hotkeys">
-          {(isMac
-            ? ["Ctrl+Option", "Ctrl+Shift", "Option+Shift", "Ctrl+Cmd", "F9", "F8"]
-            : ["Ctrl+Win", "Ctrl+Alt", "Win+Shift", "Ctrl+Shift", "F9", "F8", "SCROLLLOCK", "PAUSE"]
-          ).map((h) => (
-            <option key={h} value={h} />
-          ))}
-        </datalist>
+        <span>Atalho de ditado — segurar e falar</span>
+        <HotkeyInput value={s.hotkey} onChange={(v) => patch({ hotkey: v })} />
+        <small>Grava enquanto a combinação estiver pressionada e transcreve ao soltar.</small>
+      </label>
+
+      <label className="field">
+        <span>Atalho de ditado — apertar para iniciar e parar</span>
+        <HotkeyInput value={s.hotkey_toggle} onChange={(v) => patch({ hotkey_toggle: v })} />
         <small>
-          {isMac
-            ? "Combos de Ctrl, Cmd, Option, Shift (ex.: Ctrl+Option) ou tecla única (F9)."
-            : "Combos de Ctrl, Win, Alt, Shift (ex.: Ctrl+Win) ou tecla única (F9, PAUSE)."}
+          Para ditados longos: aperta uma vez para começar, aperta de novo para encerrar. Os dois
+          atalhos funcionam ao mesmo tempo — deixe em branco o que não quiser usar.
+        </small>
+      </label>
+
+      <label className="field">
+        <span>Atalho para trocar de perfil</span>
+        <HotkeyInput
+          value={s.hotkey_cycle_profile}
+          onChange={(v) => patch({ hotkey_cycle_profile: v })}
+        />
+        <small>
+          Avança para o próximo perfil da lista e mostra o nome dele na tela. Clique no campo e
+          tecle a combinação — comece pelos modificadores.{" "}
+          {isMac ? "Ex.: Ctrl+Option+P." : "Ex.: Ctrl+Alt+P."}
         </small>
       </label>
 
@@ -268,28 +396,6 @@ function GeneralTab({ s, patch }: TabProps) {
           </span>
           {autostart ? "Ativado" : "Desativado"}
         </label>
-      </div>
-
-      <div className="field">
-        <span>Modo de ditado</span>
-        <div className="radio-row">
-          <label>
-            <input
-              type="radio"
-              checked={s.mode !== "toggle"}
-              onChange={() => patch({ mode: "hold" })}
-            />
-            Pressionar e segurar
-          </label>
-          <label>
-            <input
-              type="radio"
-              checked={s.mode === "toggle"}
-              onChange={() => patch({ mode: "toggle" })}
-            />
-            Apertar para iniciar/parar
-          </label>
-        </div>
       </div>
 
       <label className="field">
@@ -451,11 +557,31 @@ function ProfilesTab({ s, patch }: TabProps) {
             placeholder='Instrução de estilo para a IA — personalidade, tom e formato do texto. Ex.: "e-mail curto e cordial, com saudação e fecho"'
             onChange={(e) => update(i, { style: e.target.value })}
           />
+          <div className="profile-hotkey">
+            <span>Atalho próprio</span>
+            <HotkeyInput value={p.hotkey} onChange={(v) => update(i, { hotkey: v })} />
+            <select
+              value={p.hotkey_mode === "toggle" ? "toggle" : "hold"}
+              onChange={(e) => update(i, { hotkey_mode: e.target.value })}
+            >
+              <option value="hold">segurar e falar</option>
+              <option value="toggle">apertar para iniciar/parar</option>
+            </select>
+          </div>
         </div>
       ))}
+      <p className="hint">
+        O atalho próprio dita direto no estilo daquele perfil, sem trocar o perfil ativo. Clique
+        no campo e tecle a combinação; comece pelos modificadores.
+      </p>
       <button
         onClick={() =>
-          patch({ profiles: [...s.profiles, { name: "Novo perfil", style: "" }] })
+          patch({
+            profiles: [
+              ...s.profiles,
+              { name: "Novo perfil", style: "", hotkey: "", hotkey_mode: "hold" },
+            ],
+          })
         }
       >
         + Adicionar perfil

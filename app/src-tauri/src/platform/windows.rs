@@ -89,14 +89,36 @@ pub fn modifier_group(name: &str) -> Option<Vec<u32>> {
     }
 }
 
-pub fn key_from_name(name: &str) -> u32 {
-    match name {
-        "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73, "F5" => 0x74, "F6" => 0x75,
-        "F7" => 0x76, "F8" => 0x77, "F10" => 0x79, "F11" => 0x7A, "F12" => 0x7B,
-        "SCROLLLOCK" => 0x91, "PAUSE" => 0x13, "CAPSLOCK" => 0x14,
-        "INSERT" => 0x2D, "HOME" => 0x24, "END" => 0x23,
-        _ => 0x78, // F9
+/// `None` para nome desconhecido: o atalho inteiro é descartado em vez de virar outra tecla.
+pub fn key_from_name(name: &str) -> Option<u32> {
+    // letras e dígitos usam o VK igual ao código ASCII maiúsculo
+    if name.len() == 1 {
+        let c = name.chars().next().unwrap();
+        if c.is_ascii_uppercase() || c.is_ascii_digit() {
+            return Some(c as u32);
+        }
     }
+    if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<u32>().ok()) {
+        if (1..=24).contains(&n) {
+            return Some(0x6F + n); // VK_F1 = 0x70
+        }
+    }
+    if let Some(n) = name.strip_prefix("NUMPAD").and_then(|n| n.parse::<u32>().ok()) {
+        if n <= 9 {
+            return Some(0x60 + n); // VK_NUMPAD0 = 0x60
+        }
+    }
+    let vk = match name {
+        "SCROLLLOCK" => 0x91, "PAUSE" => 0x13, "CAPSLOCK" => 0x14, "NUMLOCK" => 0x90,
+        "INSERT" => 0x2D, "HOME" => 0x24, "END" => 0x23, "DELETE" => 0x2E,
+        "PAGEUP" => 0x21, "PAGEDOWN" => 0x22,
+        "UP" => 0x26, "DOWN" => 0x28, "LEFT" => 0x25, "RIGHT" => 0x27,
+        "SPACE" => 0x20, "ENTER" | "RETURN" => 0x0D, "TAB" => 0x09,
+        "ESC" | "ESCAPE" => 0x1B, "BACKSPACE" => 0x08,
+        "MULTIPLY" => 0x6A, "ADD" => 0x6B, "SUBTRACT" => 0x6D, "DECIMAL" => 0x6E, "DIVIDE" => 0x6F,
+        _ => return None,
+    };
+    Some(vk)
 }
 
 // --- Hook WH_KEYBOARD_LL próprio: só rastreia keydown/keyup de VKs. O rdev chamava
@@ -138,8 +160,8 @@ pub fn spawn_hotkey_listener(shared: Arc<Shared>, tx: Sender<Cmd>) {
                 shared,
                 tx,
                 pressed: HashSet::new(),
-                active: false,
-                recording: false,
+                latched: None,
+                recording: None,
             });
         });
         println!("[hotkey] instalando hook global...");

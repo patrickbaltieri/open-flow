@@ -38,13 +38,29 @@ pub fn modifier_group(name: &str) -> Option<Vec<u32>> {
     }
 }
 
-pub fn key_from_name(name: &str) -> u32 {
-    match name {
+/// `None` para nome desconhecido: o atalho inteiro é descartado em vez de virar outra tecla.
+/// Códigos kVK_* (posição física no teclado ANSI, não o caractere gerado).
+pub fn key_from_name(name: &str) -> Option<u32> {
+    let code = match name {
+        "A" => 0, "S" => 1, "D" => 2, "F" => 3, "H" => 4, "G" => 5, "Z" => 6, "X" => 7,
+        "C" => 8, "V" => 9, "B" => 11, "Q" => 12, "W" => 13, "E" => 14, "R" => 15, "Y" => 16,
+        "T" => 17, "O" => 31, "U" => 32, "I" => 34, "P" => 35, "L" => 37, "J" => 38, "K" => 40,
+        "N" => 45, "M" => 46,
+        "1" => 18, "2" => 19, "3" => 20, "4" => 21, "5" => 23, "6" => 22, "7" => 26, "8" => 28,
+        "9" => 25, "0" => 29,
         "F1" => 122, "F2" => 120, "F3" => 99, "F4" => 118, "F5" => 96, "F6" => 97,
-        "F7" => 98, "F8" => 100, "F10" => 109, "F11" => 103, "F12" => 111,
+        "F7" => 98, "F8" => 100, "F9" => 101, "F10" => 109, "F11" => 103, "F12" => 111,
+        "F13" => 105, "F14" => 107, "F15" => 113, "F16" => 106, "F17" => 64, "F18" => 79,
+        "F19" => 80, "F20" => 90,
+        "NUMPAD0" => 82, "NUMPAD1" => 83, "NUMPAD2" => 84, "NUMPAD3" => 85, "NUMPAD4" => 86,
+        "NUMPAD5" => 87, "NUMPAD6" => 88, "NUMPAD7" => 89, "NUMPAD8" => 91, "NUMPAD9" => 92,
         "CAPSLOCK" => 57, "INSERT" | "HELP" => 114, "HOME" => 115, "END" => 119,
-        _ => 101, // F9
-    }
+        "PAGEUP" => 116, "PAGEDOWN" => 121, "DELETE" => 117, "BACKSPACE" => 51,
+        "UP" => 126, "DOWN" => 125, "LEFT" => 123, "RIGHT" => 124,
+        "SPACE" => 49, "ENTER" | "RETURN" => 36, "TAB" => 48, "ESC" | "ESCAPE" => 53,
+        _ => return None,
+    };
+    Some(code)
 }
 
 // --- FFI CoreGraphics (o crate core-graphics não expõe estes dois) ---
@@ -77,8 +93,8 @@ pub fn spawn_hotkey_listener(shared: Arc<Shared>, tx: Sender<Cmd>) {
             shared,
             tx,
             pressed: HashSet::new(),
-            active: false,
-            recording: false,
+            latched: None,
+            recording: None,
         });
         let own_pid = std::process::id() as i64;
         println!("[hotkey] instalando event tap global...");

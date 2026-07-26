@@ -34,6 +34,22 @@
         "resizable": false,
         "focus": false,
         "shadow": false
+      },
+      {
+        "label": "toast",
+        "url": "/?toast=1",
+        "title": "Open Flow Toast",
+        "width": 260,
+        "height": 44,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "resizable": false,
+        "focus": false,
+        "shadow": false
       }
     ],
     "security": {
