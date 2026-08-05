@@ -56,6 +56,9 @@ struct Settings {
     output_lang: String,
     gemini_model: String,
     gemini_api_key: Option<String>,
+    /// quem reescreve o texto: "gemini" ou "groq" (reaproveita a chave da transcrição)
+    rewrite_provider: String,
+    groq_rewrite_model: String,
     wave_style: String,
     theme: String,
     profiles: Vec<Profile>,
@@ -130,6 +133,8 @@ impl Default for Settings {
             output_lang: "same".into(),
             gemini_model: "gemini-3.1-flash-lite".into(),
             gemini_api_key: None,
+            rewrite_provider: "gemini".into(),
+            groq_rewrite_model: "llama-3.3-70b-versatile".into(),
             wave_style: "tech".into(),
             theme: "dark".into(),
             profiles: default_profiles(),
@@ -224,6 +229,12 @@ fn load_settings() -> (Settings, bool) {
                     s.hotkey_toggle = std::mem::take(&mut s.hotkey);
                 }
                 s.mode = "hold".into();
+                if s.rewrite_provider.is_empty() {
+                    s.rewrite_provider = "gemini".into();
+                }
+                if s.groq_rewrite_model.is_empty() {
+                    s.groq_rewrite_model = "llama-3.3-70b-versatile".into();
+                }
                 for p in &mut s.profiles {
                     if p.hotkey_mode.is_empty() {
                         p.hotkey_mode = "hold".into();
@@ -433,6 +444,24 @@ fn wav_bytes(samples: &[f32], rate: u32) -> Vec<u8> {
     cursor.into_inner()
 }
 
+/// Cliente HTTP único para as APIs de nuvem. Criar um por chamada custava um
+/// handshake TCP+TLS a cada ditado e, pior, sorteava um endereço novo toda vez:
+/// em rede com IPv6 anunciado mas sem rota (VPN que bloqueia IPv6, por exemplo)
+/// a conexão fica pendurada até o timeout de 30s. Amarrar a saída em IPv4 e
+/// reaproveitar a conexão elimina os dois problemas.
+fn cloud_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(5))
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("cliente HTTP de nuvem")
+    })
+}
+
 fn sidecar_healthy(port: u16) -> bool {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -484,11 +513,7 @@ fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
     if s.speech_lang != "auto" {
         form = form.text("language", s.speech_lang.clone());
     }
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let resp = client
+    let resp = cloud_client()
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
         .bearer_auth(key)
         .multipart(form)
@@ -565,16 +590,51 @@ fn build_prompt(s: &Settings, profile: &str) -> String {
 }
 
 fn rewrite(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
+    if s.rewrite_provider == "groq" {
+        return rewrite_groq(raw, s, profile);
+    }
+    rewrite_gemini(raw, s, profile)
+}
+
+/// Reescrita pela Groq, com a mesma chave da transcrição. Latência bem mais
+/// estável que o free tier do Gemini, que oscila de 0,5s a mais de 30s.
+fn rewrite_groq(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
+    let key = s.groq_api_key.clone().filter(|k| !k.is_empty()).ok_or("chave Groq ausente")?;
+    let body = serde_json::json!({
+        "model": s.groq_rewrite_model,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": format!("{}{}", build_prompt(s, profile), raw)}]
+    });
+    let v: serde_json::Value = cloud_client()
+        .post("https://api.groq.com/openai/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("Groq (reescrita): {e}"))?
+        .json()
+        .map_err(|e| e.to_string())?;
+    if let Some(msg) = v["error"]["message"].as_str() {
+        return Err(format!("Groq (reescrita): {msg}"));
+    }
+    let text = v["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    // modelos com cadeia de raciocínio devolvem <think>...</think> antes da resposta
+    let text = match text.rsplit_once("</think>") {
+        Some((_, depois)) => depois,
+        None => text,
+    };
+    if text.trim().is_empty() {
+        return Err(format!("resposta vazia da Groq: {v}"));
+    }
+    Ok(text.trim().to_string())
+}
+
+fn rewrite_gemini(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
     let key = s
         .gemini_api_key
         .clone()
         .filter(|k| !k.is_empty())
         .or_else(|| std::env::var("GEMINI_API_KEY").ok())
         .ok_or("chave do Gemini ausente (settings.json ou GEMINI_API_KEY)")?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| e.to_string())?;
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         s.gemini_model, key
@@ -583,7 +643,7 @@ fn rewrite(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
         "contents": [{"parts": [{"text": format!("{}{}", build_prompt(s, profile), raw)}]}],
         "generationConfig": {"temperature": 0.2}
     });
-    let v: serde_json::Value = client
+    let v: serde_json::Value = cloud_client()
         .post(url)
         .json(&body)
         .send()
@@ -622,13 +682,35 @@ fn apply_snippets(text: &str, snippets: &[Snippet]) -> String {
 }
 
 fn insert_text(text: &str) -> Result<(), String> {
-    let mut clip = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let mut clip = arboard::Clipboard::new().map_err(|e| {
+        app_log("insert.log", &format!("clipboard indisponível: {e}"));
+        e.to_string()
+    })?;
     let backup = clip.get_text().ok();
-    clip.set_text(text).map_err(|e| e.to_string())?;
+    clip.set_text(text).map_err(|e| {
+        app_log("insert.log", &format!("set_text falhou: {e}"));
+        e.to_string()
+    })?;
     std::thread::sleep(Duration::from_millis(60));
     // modificador físico ainda pressionado + V sintético formaria combos do sistema
     platform::wait_modifiers_released(Duration::from_secs(1));
-    platform::paste_shortcut()?;
+    app_log(
+        "insert.log",
+        &format!(
+            "colando {} chars | alvo={} | mods presos={} | backup={}",
+            text.chars().count(),
+            platform::foreground_window_desc(),
+            platform::modifiers_down(),
+            if backup.is_some() { "sim" } else { "não (clipboard vazio)" },
+        ),
+    );
+    match platform::paste_shortcut() {
+        Ok(()) => app_log("insert.log", "paste_shortcut retornou ok"),
+        Err(e) => {
+            app_log("insert.log", &format!("paste_shortcut FALHOU: {e}"));
+            return Err(e);
+        }
+    }
     std::thread::sleep(Duration::from_millis(300));
     if let Some(b) = backup {
         let _ = clip.set_text(b);
@@ -654,14 +736,18 @@ fn append_history(entry: &HistoryEntry) {
     }
 }
 
-fn overlay_log(msg: &str) {
+fn app_log(file: &str, msg: &str) {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let _ = std::fs::create_dir_all(config_dir());
     if let Ok(mut f) =
-        std::fs::OpenOptions::new().create(true).append(true).open(config_dir().join("overlay.log"))
+        std::fs::OpenOptions::new().create(true).append(true).open(config_dir().join(file))
     {
         let _ = writeln!(f, "{ts} {msg}");
     }
+}
+
+fn overlay_log(msg: &str) {
+    app_log("overlay.log", msg);
 }
 
 fn overlay_show(app: &AppHandle) {

@@ -35,6 +35,8 @@ export interface Settings {
   output_lang: string;
   gemini_model: string;
   gemini_api_key: string | null;
+  rewrite_provider: string;
+  groq_rewrite_model: string;
   wave_style: string;
   theme: string;
   profiles: Profile[];
@@ -487,20 +489,56 @@ function GeneralTab({ s, patch }: TabProps) {
         </small>
       </label>
       <label className="field">
-        <span>Modelo de reescrita (Gemini)</span>
-        <input
-          value={s.gemini_model}
-          onChange={(e) => patch({ gemini_model: e.target.value })}
-        />
+        <span>Provedor da reescrita</span>
+        <select
+          value={s.rewrite_provider === "groq" ? "groq" : "gemini"}
+          onChange={(e) => patch({ rewrite_provider: e.target.value })}
+        >
+          <option value="gemini">Gemini (Google)</option>
+          <option value="groq">Groq — usa a mesma chave da transcrição</option>
+        </select>
+        <small>
+          A Groq dispensa uma segunda chave e costuma responder em menos de 1s. O free tier do
+          Gemini não garante latência: pode ir de 0,5s a mais de 30s no mesmo dia.
+        </small>
       </label>
-      <label className="field">
-        <span>Chave da API Gemini</span>
-        <SecretInput
-          value={s.gemini_api_key ?? ""}
-          onChange={(v) => patch({ gemini_api_key: v || null })}
-        />
-        <small>Grátis: aistudio.google.com/apikey</small>
-      </label>
+
+      {s.rewrite_provider === "groq" ? (
+        <label className="field">
+          <span>Modelo de reescrita (Groq)</span>
+          <input
+            list="groq-rewrite-models"
+            value={s.groq_rewrite_model}
+            onChange={(e) => patch({ groq_rewrite_model: e.target.value })}
+          />
+          <datalist id="groq-rewrite-models">
+            {["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"].map(
+              (m) => (
+                <option key={m} value={m} />
+              )
+            )}
+          </datalist>
+          <small>Limite do free tier: 1.000 requisições por dia, por modelo.</small>
+        </label>
+      ) : (
+        <>
+          <label className="field">
+            <span>Modelo de reescrita (Gemini)</span>
+            <input
+              value={s.gemini_model}
+              onChange={(e) => patch({ gemini_model: e.target.value })}
+            />
+          </label>
+          <label className="field">
+            <span>Chave da API Gemini</span>
+            <SecretInput
+              value={s.gemini_api_key ?? ""}
+              onChange={(v) => patch({ gemini_api_key: v || null })}
+            />
+            <small>Grátis: aistudio.google.com/apikey</small>
+          </label>
+        </>
+      )}
     </section>
   );
 }

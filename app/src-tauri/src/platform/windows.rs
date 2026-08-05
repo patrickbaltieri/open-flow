@@ -191,6 +191,44 @@ pub fn wait_modifiers_released(timeout: Duration) {
     }
 }
 
+/// diagnóstico: quais modificadores continuam fisicamente pressionados
+pub fn modifiers_down() -> String {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let down: Vec<&str> = [(0x10i32, "Shift"), (0x11, "Ctrl"), (0x12, "Alt"), (0x5B, "LWin"), (0x5C, "RWin")]
+        .iter()
+        .filter(|(vk, _)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
+        .map(|(_, n)| *n)
+        .collect();
+    if down.is_empty() {
+        "nenhum".into()
+    } else {
+        down.join("+")
+    }
+}
+
+/// diagnóstico: para onde o Ctrl+V sintético vai. Janela elevada recusa a
+/// colagem de processo comum (UIPI) sem devolver erro.
+pub fn foreground_window_desc() -> String {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    };
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return "nenhuma janela em foco".into();
+        }
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32).max(0) as usize;
+        let title = String::from_utf16_lossy(&buf[..n]);
+        let mut cls = [0u16; 128];
+        let n = GetClassNameW(hwnd, cls.as_mut_ptr(), cls.len() as i32).max(0) as usize;
+        let class = String::from_utf16_lossy(&cls[..n]);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        format!("\"{title}\" classe={class} pid={pid}")
+    }
+}
+
 pub fn paste_shortcut() -> Result<(), String> {
     use enigo::{Direction, Enigo, Key, Keyboard};
     let mut enigo = Enigo::new(&enigo::Settings::default()).map_err(|e| e.to_string())?;

@@ -38,6 +38,15 @@ pub fn modifier_group(name: &str) -> Option<Vec<u32>> {
     }
 }
 
+/// diagnóstico do Windows; no mac o log de inserção não coleta esses dados
+pub fn modifiers_down() -> String {
+    "n/d".into()
+}
+
+pub fn foreground_window_desc() -> String {
+    "n/d".into()
+}
+
 /// `None` para nome desconhecido: o atalho inteiro é descartado em vez de virar outra tecla.
 /// Códigos kVK_* (posição física no teclado ANSI, não o caractere gerado).
 pub fn key_from_name(name: &str) -> Option<u32> {
