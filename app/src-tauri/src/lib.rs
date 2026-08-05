@@ -46,6 +46,8 @@ struct Settings {
     hotkey_toggle: String,
     /// atalho que avança para o próximo perfil da lista
     hotkey_cycle_profile: String,
+    /// tecla que aborta o ditado em andamento; vazio desliga
+    cancel_key: String,
     /// legado: antes escolhia o modo do atalho único. Só é lido na migração.
     mode: String,
     mic: Option<String>,
@@ -124,6 +126,11 @@ impl Default for Settings {
             hotkey: default_hotkey(),
             hotkey_toggle: String::new(),
             hotkey_cycle_profile: String::new(),
+            // Esc e não Espaço: com o atalho segurado, Ctrl+Option+Espaço (mac) e
+            // Win+Espaço (Windows) são atalhos do sistema que trocam a fonte de
+            // entrada — o hook é listen-only, então o sistema recebe a combinação
+            // junto e o layout do teclado muda no meio do ditado.
+            cancel_key: "ESC".into(),
             mode: "hold".into(),
             mic: None,
             stt_provider: "groq".into(),
@@ -153,10 +160,18 @@ impl Default for Settings {
 struct Shared {
     settings: Mutex<Settings>,
     bindings: Mutex<Vec<Binding>>,
+    cancel: Mutex<Option<u32>>,
     sidecar: Mutex<Option<std::process::Child>>,
     insert_lock: Mutex<()>,
     /// preenchido no setup(); o hook de teclado precisa dele para trocar perfil e avisar na tela
     app: OnceLock<AppHandle>,
+    /// último texto inserido: a colagem pode falhar sem erro (janela sem foco,
+    /// campo não editável) e o clipboard volta ao valor antigo 300ms depois —
+    /// sem esta cópia o ditado some sem deixar rastro
+    last_text: Mutex<String>,
+    /// cada exibição do overlay ganha um número; quem termina tarde só mexe na
+    /// janela se ainda for o dono dela (ditar de novo enquanto o anterior processa)
+    overlay_gen: AtomicU64,
 }
 
 impl Settings {
@@ -323,6 +338,17 @@ fn build_bindings(s: &Settings) -> Vec<Binding> {
     // mais teclas = mais específico. Sem isto, Ctrl+Win dispararia junto com Ctrl+Win+J.
     v.sort_by(|a, b| b.groups.len().cmp(&a.groups.len()));
     v
+}
+
+/// vazio = cancelamento desligado
+fn parse_cancel_key(s: &str) -> Option<u32> {
+    let name = s.trim().to_uppercase();
+    if name.is_empty() {
+        return None;
+    }
+    // key_from_name devolve None para nome desconhecido: tecla inválida desliga o
+    // cancelamento em vez de virar F9 por engano
+    platform::key_from_name(&name)
 }
 
 type LevelFn = Box<dyn FnMut(f32) + Send>;
@@ -750,8 +776,11 @@ fn overlay_log(msg: &str) {
     app_log("overlay.log", msg);
 }
 
-fn overlay_show(app: &AppHandle) {
-    let style = app.state::<Arc<Shared>>().settings.lock().unwrap().wave_style.clone();
+/// mostra o overlay e devolve o número desta exibição
+fn overlay_show(app: &AppHandle) -> u64 {
+    let shared = app.state::<Arc<Shared>>();
+    let gen = shared.overlay_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let style = shared.settings.lock().unwrap().wave_style.clone();
     if let Some(o) = app.get_webview_window("overlay") {
         // monitor onde está o cursor (foco de digitação), não o primário
         let mon = o
@@ -768,19 +797,73 @@ fn overlay_show(app: &AppHandle) {
             }
         }
         let _ = o.set_always_on_top(true);
-        if let Err(e) = o.show() {
-            overlay_log(&format!("show falhou: {e}"));
-        }
         let _ = app.emit_to("overlay", "overlay_show", style);
     } else {
         overlay_log("janela overlay inexistente");
     }
+    gen
 }
 
-fn overlay_hide(app: &AppHandle) {
-    if let Some(o) = app.get_webview_window("overlay") {
-        let _ = o.hide();
+/// só apaga se esta exibição ainda for a atual
+///
+/// A janela do overlay nasce visível e nunca é escondida: no Windows, esconder e
+/// reexibir a janela deixa a webview sem pintar — a janela reaparecia no lugar
+/// certo, no topo, do tamanho certo, e mesmo assim invisível, porque o conteúdo
+/// nunca era apresentado. Quem "some" e "aparece" agora é só o conteúdo, do lado
+/// do React; a janela em si fica parada, transparente e sem capturar cliques.
+fn overlay_hide(app: &AppHandle, gen: u64) {
+    if app.state::<Arc<Shared>>().overlay_gen.load(Ordering::SeqCst) != gen {
+        return;
     }
+    let _ = app.emit_to("overlay", "overlay_hide", ());
+}
+
+fn overlay_status(app: &AppHandle, state: &str, message: &str) {
+    let _ = app.emit_to(
+        "overlay",
+        "overlay_status",
+        serde_json::json!({ "state": state, "message": message }),
+    );
+}
+
+/// mensagem técnica -> frase curta que cabe no overlay
+fn friendly_error(e: &str) -> String {
+    let low = e.to_lowercase();
+    let msg = if low.contains("microfone") || low.contains("sem microfone") {
+        "Microfone não encontrado"
+    } else if low.contains("429") || low.contains("rate limit") || low.contains("quota") {
+        "Limite da API atingido"
+    } else if low.contains("401") || low.contains("403") || low.contains("chave") {
+        "Chave de API inválida ou ausente"
+    } else if low.contains("timed out")
+        || low.contains("timeout")
+        || low.contains("dns")
+        || low.contains("connect")
+    {
+        "Sem conexão com o serviço"
+    } else if low.contains("transcrição local") {
+        "Transcrição local indisponível"
+    } else if low.contains("alucinação") || low.contains("transcrição vazia") {
+        "Nada foi dito"
+    } else if low.contains("clipboard") || low.contains("área de transferência") {
+        "Não consegui colar o texto"
+    } else {
+        return e.chars().take(70).collect();
+    };
+    msg.to_string()
+}
+
+/// mostra o motivo da falha por alguns segundos — sem isso o ditado some em silêncio
+fn overlay_fail(app: &AppHandle, gen: u64, err: &str) {
+    if app.state::<Arc<Shared>>().overlay_gen.load(Ordering::SeqCst) != gen {
+        return;
+    }
+    overlay_status(app, "error", &friendly_error(err));
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(3200));
+        overlay_hide(&app, gen);
+    });
 }
 
 /// cada toast recebe um número; só o mais recente pode se apagar sozinho
@@ -844,6 +927,7 @@ enum Cmd {
     /// `Some(perfil)` dita naquele estilo sem mexer no perfil ativo
     Start(Option<String>),
     Stop,
+    Cancel,
 }
 
 fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
@@ -852,11 +936,12 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
         let mut rec = Recorder::new();
         // perfil pedido pelo atalho que iniciou a gravação em curso
         let mut pending_profile: Option<String> = None;
+        let mut gen = 0u64;
         loop {
             match rx.recv() {
                 Ok(Cmd::Start(profile)) => {
                     pending_profile = profile;
-                    overlay_show(&app);
+                    gen = overlay_show(&app);
                     let mic = shared.settings.lock().unwrap().mic.clone();
                     let app_lvl = app.clone();
                     let mut last = Instant::now() - Duration::from_secs(1);
@@ -868,30 +953,42 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                     });
                     if let Err(e) = rec.start(mic.as_deref(), on_level) {
                         eprintln!("[pipeline] gravação falhou: {e}");
-                        overlay_hide(&app);
+                        overlay_fail(&app, gen, &e);
                     } else {
                         println!("[pipeline] gravando...");
                     }
                 }
+                Ok(Cmd::Cancel) => {
+                    let _ = rec.stop();
+                    overlay_hide(&app, gen);
+                    println!("[pipeline] ditado cancelado");
+                }
                 Ok(Cmd::Stop) => {
-                    overlay_hide(&app);
+                    // o overlay só sai depois da colagem: some antes = parece ter falhado
                     let forced_profile = pending_profile.take();
                     let (samples, rate) = rec.stop();
                     let secs = samples.len() as f32 / rate as f32;
                     if secs < 0.4 {
                         println!("[pipeline] áudio curto demais ({secs:.1}s), ignorado");
+                        overlay_hide(&app, gen);
                         continue;
                     }
                     let peak = peak_rms(&samples, rate);
                     if peak < 0.006 {
                         println!("[pipeline] sem fala detectada (pico rms {peak:.4}), ignorado");
+                        overlay_hide(&app, gen);
                         continue;
                     }
+                    // overlay segue no ar em "processando": soltar o atalho e ver a
+                    // janela sumir por 2-3s é indistinguível de ter falhado
+                    overlay_status(&app, "processing", "");
                     // processamento em thread própria: a thread do atalho fica livre e o
                     // próximo Start é imediato (overlay e gravação sem atraso de fila)
                     let s = shared.settings.lock().unwrap().clone();
                     let profile = forced_profile.unwrap_or_else(|| s.active_profile.clone());
                     let shared_w = shared.clone();
+                    let app_w = app.clone();
+                    let gen_w = gen;
                     std::thread::spawn(move || {
                         let t0 = Instant::now();
                         let result = run_stt(wav_bytes(&samples, rate), &shared_w, &s)
@@ -924,11 +1021,16 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                                         total_secs: total,
                                     });
                                 }
+                                *shared_w.last_text.lock().unwrap() = final_text.clone();
                                 let _serial = shared_w.insert_lock.lock().unwrap();
                                 insert_text(&final_text)
                             });
-                        if let Err(e) = result {
-                            eprintln!("[pipeline] erro: {e}");
+                        match result {
+                            Ok(()) => overlay_hide(&app_w, gen_w),
+                            Err(e) => {
+                                eprintln!("[pipeline] erro: {e}");
+                                overlay_fail(&app_w, gen_w, &e);
+                            }
                         }
                     });
                 }
@@ -960,6 +1062,15 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
         st.pressed.insert(vk);
     } else {
         st.pressed.remove(&vk);
+    }
+
+    // aborta o ditado em andamento sem inserir nada. No modo hold o atalho segue
+    // pressionado, mas `latched` continua apontando para ele: ao soltar, o Release
+    // não acha mais a gravação e não dispara Stop.
+    if down && st.recording.is_some() && *st.shared.cancel.lock().unwrap() == Some(vk) {
+        st.recording = None;
+        let _ = st.tx.send(Cmd::Cancel);
+        return;
     }
 
     enum Step {
@@ -1060,6 +1171,7 @@ fn save_settings(
 ) -> Result<(), String> {
     persist_settings(&settings)?;
     *state.bindings.lock().unwrap() = build_bindings(&settings);
+    *state.cancel.lock().unwrap() = parse_cancel_key(&settings.cancel_key);
     let warm_local = settings.stt_provider == "local";
     rebuild_tray_menu(&app, &settings);
     *state.settings.lock().unwrap() = settings;
@@ -1116,6 +1228,7 @@ struct Diagnostics {
     stt_provider: String,
     groq_key_set: bool,
     sidecar_ok: bool,
+    sidecar_configured: bool,
     sidecar_device: String,
     default_mic: String,
     gemini_key_set: bool,
@@ -1138,10 +1251,15 @@ fn get_diagnostics(state: tauri::State<Arc<Shared>>) -> Diagnostics {
         .default_input_device()
         .and_then(|d| d.name().ok())
         .unwrap_or_else(|| "nenhum".into());
+    // sem os dois caminhos no disco o modo local nunca sobe — e "descarregado"
+    // parece normal, escondendo que ele simplesmente não existe nesta máquina
+    let sidecar_configured =
+        std::path::Path::new(&s.python).exists() && std::path::Path::new(&s.sidecar).exists();
     Diagnostics {
         stt_provider: s.stt_provider.clone(),
         groq_key_set: s.groq_ready(),
         sidecar_ok,
+        sidecar_configured,
         sidecar_device,
         default_mic,
         gemini_key_set: s.gemini_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false)
@@ -1169,14 +1287,244 @@ fn build_tray_menu(app: &AppHandle, s: &Settings) -> tauri::Result<Menu<tauri::W
     let refs: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
         items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<tauri::Wry>).collect();
     let perfil = Submenu::with_items(app, "Perfil", true, &refs)?;
+    let copy_last =
+        MenuItem::with_id(app, "copy_last", "Copiar último ditado", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Configurações", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
-    Menu::with_items(app, &[&perfil, &show, &quit])
+    Menu::with_items(app, &[&perfil, &copy_last, &show, &quit])
 }
 
 fn rebuild_tray_menu(app: &AppHandle, s: &Settings) {
     if let (Some(tray), Ok(menu)) = (app.tray_by_id("tray"), build_tray_menu(app, s)) {
         let _ = tray.set_menu(Some(menu));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `mode` deixou de ser um campo: agora o comportamento vem de qual atalho
+    /// disparou. "hold" usa `hotkey`, "toggle" usa `hotkey_toggle`.
+    fn hook(mode: &str, cancel: &str) -> (HookState, std::sync::mpsc::Receiver<Cmd>) {
+        let mut s = Settings::default();
+        if mode == "toggle" {
+            s.hotkey_toggle = std::mem::take(&mut s.hotkey);
+        }
+        s.cancel_key = cancel.into();
+        let shared = Arc::new(Shared {
+            bindings: Mutex::new(build_bindings(&s)),
+            cancel: Mutex::new(parse_cancel_key(cancel)),
+            sidecar: Mutex::new(None),
+            settings: Mutex::new(s),
+            insert_lock: Mutex::new(()),
+            app: OnceLock::new(),
+            last_text: Mutex::new(String::new()),
+            overlay_gen: AtomicU64::new(0),
+        });
+        let (tx, rx) = channel::<Cmd>();
+        (HookState { shared, tx, pressed: HashSet::new(), latched: None, recording: None }, rx)
+    }
+
+    fn key(name: &str) -> u32 {
+        platform::key_from_name(name).expect("tecla conhecida")
+    }
+
+    /// modificadores vêm de modifier_group (têm variante esquerda e direita)
+    fn modkey(name: &str) -> u32 {
+        platform::modifier_group(name).expect("modificador conhecido")[0]
+    }
+
+    /// primeiro grupo do atalho de ditado (Ctrl) e segundo (Win/Cmd)
+    fn hotkey_codes(st: &HookState) -> (u32, u32) {
+        let b = st.shared.bindings.lock().unwrap();
+        let g = &b[0].groups;
+        (g[0][0], g[1][0])
+    }
+
+    #[test]
+    fn cancelar_no_hold_nao_dispara_stop_ao_soltar() {
+        let (mut st, rx) = hook("hold", "SPACE");
+        let (ctrl, win) = hotkey_codes(&st);
+        let space = key("SPACE");
+
+        handle_key(&mut st, ctrl, true);
+        handle_key(&mut st, win, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(_))));
+
+        handle_key(&mut st, space, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Cancel)));
+
+        // soltar o atalho depois do cancelamento não pode mandar o áudio para o STT
+        handle_key(&mut st, space, false);
+        handle_key(&mut st, win, false);
+        handle_key(&mut st, ctrl, false);
+        assert!(rx.try_recv().is_err(), "Stop fantasma depois de cancelar");
+
+        // e o próximo ditado continua funcionando
+        handle_key(&mut st, ctrl, true);
+        handle_key(&mut st, win, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(_))));
+    }
+
+    #[test]
+    fn cancelar_no_toggle_permite_novo_ditado() {
+        let (mut st, rx) = hook("toggle", "ESC");
+        let (ctrl, win) = hotkey_codes(&st);
+        let esc = key("ESC");
+
+        handle_key(&mut st, ctrl, true);
+        handle_key(&mut st, win, true);
+        handle_key(&mut st, win, false);
+        handle_key(&mut st, ctrl, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(_))));
+
+        handle_key(&mut st, esc, true);
+        handle_key(&mut st, esc, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Cancel)));
+
+        handle_key(&mut st, ctrl, true);
+        handle_key(&mut st, win, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(_))), "toggle travado depois do cancelamento");
+    }
+
+    #[test]
+    fn cancelamento_desativado_ignora_a_tecla() {
+        let (mut st, rx) = hook("hold", "");
+        let (ctrl, win) = hotkey_codes(&st);
+        handle_key(&mut st, ctrl, true);
+        handle_key(&mut st, win, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(_))));
+
+        handle_key(&mut st, key("SPACE"), true);
+        assert!(rx.try_recv().is_err());
+
+        handle_key(&mut st, win, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
+    }
+
+    /// monta um HookState com atalhos arbitrários, para os cenários de vários vínculos
+    fn hook_com(ajusta: impl FnOnce(&mut Settings)) -> (HookState, std::sync::mpsc::Receiver<Cmd>) {
+        let mut s = Settings::default();
+        ajusta(&mut s);
+        let shared = Arc::new(Shared {
+            bindings: Mutex::new(build_bindings(&s)),
+            cancel: Mutex::new(parse_cancel_key(&s.cancel_key)),
+            sidecar: Mutex::new(None),
+            settings: Mutex::new(s),
+            insert_lock: Mutex::new(()),
+            app: OnceLock::new(),
+            last_text: Mutex::new(String::new()),
+            overlay_gen: AtomicU64::new(0),
+        });
+        let (tx, rx) = channel::<Cmd>();
+        (HookState { shared, tx, pressed: HashSet::new(), latched: None, recording: None }, rx)
+    }
+
+    #[test]
+    fn atalho_de_perfil_dita_naquele_estilo_sem_trocar_o_ativo() {
+        let (mut st, rx) = hook_com(|s| {
+            s.hotkey = "Ctrl+Win".into();
+            s.profiles[1].hotkey = "Ctrl+Alt+J".into();
+        });
+        let alvo = st.shared.settings.lock().unwrap().profiles[1].name.clone();
+
+        handle_key(&mut st, modkey("CTRL"), true);
+        handle_key(&mut st, modkey("ALT"), true);
+        handle_key(&mut st, key("J"), true);
+        match rx.try_recv() {
+            Ok(Cmd::Start(Some(p))) => assert_eq!(p, alvo, "ditou no perfil errado"),
+            Ok(Cmd::Start(None)) => panic!("Start sem perfil: o vínculo do perfil não foi usado"),
+            _ => panic!("esperava Start com o perfil do atalho"),
+        }
+        // o perfil ativo não pode ter mudado
+        assert_eq!(st.shared.settings.lock().unwrap().active_profile, "Bruto corrigido");
+
+        handle_key(&mut st, key("J"), false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
+    }
+
+    #[test]
+    fn atalho_mais_especifico_ganha_do_mais_curto() {
+        // Ctrl+Win e Ctrl+Win+J juntos: completar a combinação maior não pode
+        // acionar a menor
+        let (mut st, rx) = hook_com(|s| {
+            s.hotkey = "Ctrl+Win".into();
+            s.profiles[1].hotkey = "Ctrl+Win+J".into();
+        });
+        let b = st.shared.bindings.lock().unwrap();
+        assert!(b[0].groups.len() >= b[b.len() - 1].groups.len(), "lista não está do mais específico para o mais genérico");
+        drop(b);
+
+        handle_key(&mut st, modkey("CTRL"), true);
+        handle_key(&mut st, modkey("WIN"), true);
+        handle_key(&mut st, key("J"), true);
+        // o primeiro a ser satisfeito foi Ctrl+Win, e ele fica travado até soltar
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))));
+        assert!(rx.try_recv().is_err(), "dois Start para um gesto só");
+    }
+
+    #[test]
+    fn atalho_de_ditado_e_de_troca_de_perfil_nao_se_misturam() {
+        let (mut st, rx) = hook_com(|s| {
+            s.hotkey = "Ctrl+Win".into();
+            s.hotkey_cycle_profile = "Ctrl+Alt+P".into();
+        });
+        handle_key(&mut st, modkey("CTRL"), true);
+        handle_key(&mut st, modkey("ALT"), true);
+        handle_key(&mut st, key("P"), true);
+        // trocar de perfil não grava áudio
+        assert!(rx.try_recv().is_err(), "atalho de perfil disparou gravação");
+    }
+
+    #[test]
+    fn atalho_invalido_e_descartado_em_vez_de_virar_outra_tecla() {
+        assert!(parse_hotkey("Ctrl+Tecla_Que_Nao_Existe").is_none());
+        assert!(parse_hotkey("").is_none());
+        assert!(parse_hotkey("Ctrl+Win").is_some());
+        // cancelamento com tecla desconhecida desliga, não vira F9
+        assert!(parse_cancel_key("xyz").is_none());
+        assert!(parse_cancel_key("").is_none());
+        assert_eq!(parse_cancel_key("ESC"), platform::key_from_name("ESC"));
+    }
+
+    #[test]
+    fn atalho_duplicado_nao_cria_dois_vinculos() {
+        let mut s = Settings::default();
+        s.hotkey = "Ctrl+Win".into();
+        s.hotkey_toggle = "Ctrl+Win".into();
+        assert_eq!(build_bindings(&s).len(), 1, "o mesmo atalho ficou em dois vínculos");
+    }
+
+    #[test]
+    fn migracao_do_modo_toggle_preserva_o_comportamento() {
+        // versões antigas guardavam o modo num campo à parte
+        let antigo = r#"{"hotkey":"Ctrl+Win","mode":"toggle"}"#;
+        let mut s: Settings = serde_json::from_str(antigo).unwrap();
+        if s.mode == "toggle" && s.hotkey_toggle.is_empty() && !s.hotkey.is_empty() {
+            s.hotkey_toggle = std::mem::take(&mut s.hotkey);
+        }
+        assert_eq!(s.hotkey_toggle, "Ctrl+Win");
+        assert!(s.hotkey.is_empty());
+        let b = build_bindings(&s);
+        assert_eq!(b.len(), 1);
+        assert!(matches!(b[0].act, Act::Record { toggle: true, profile: None }));
+    }
+
+    #[test]
+    fn provedor_de_reescrita_migra_para_gemini() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.rewrite_provider, "gemini", "quem já usava não pode mudar de provedor sozinho");
+    }
+
+    #[test]
+    fn erros_viram_frases_curtas() {
+        assert_eq!(friendly_error("Groq HTTP 401: {\"error\":...}"), "Chave de API inválida ou ausente");
+        assert_eq!(friendly_error("Groq HTTP 429: rate limit"), "Limite da API atingido");
+        assert_eq!(friendly_error("microfone 'Yeti' não encontrado"), "Microfone não encontrado");
+        assert_eq!(friendly_error("transcrição vazia"), "Nada foi dito");
+        // sem regra conhecida: mostra o original, curto o bastante para caber
+        assert!(friendly_error(&"x".repeat(200)).chars().count() <= 70);
     }
 }
 
@@ -1188,16 +1536,25 @@ pub fn run() {
     let start_local = settings.stt_provider != "groq" || !settings.groq_ready();
     let shared = Arc::new(Shared {
         bindings: Mutex::new(build_bindings(&settings)),
+        cancel: Mutex::new(parse_cancel_key(&settings.cancel_key)),
         sidecar: Mutex::new(if start_local { platform::spawn_sidecar(&settings) } else { None }),
         settings: Mutex::new(settings.clone()),
         insert_lock: Mutex::new(()),
         app: OnceLock::new(),
+        last_text: Mutex::new(String::new()),
+        overlay_gen: AtomicU64::new(0),
     });
 
     let shared_exit = shared.clone();
     let shared_setup = shared.clone();
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // no boot o app pode subir duas vezes (autostart do registro + atalho em
+            // shell:startup, ou o "reabrir apps ao entrar" do Windows). A segunda cai
+            // aqui e abria as configurações na cara do usuário — quem vem do boot só sai.
+            if args.iter().any(|a| a == "--autostart") {
+                return;
+            }
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
                 let _ = w.set_focus();
@@ -1206,7 +1563,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            None,
+            Some(vec!["--autostart"]),
         ))
         .manage(shared)
         .invoke_handler(tauri::generate_handler![
@@ -1242,9 +1599,14 @@ pub fn run() {
                 let _: *mut AnyObject = msg_send![token, retain]; // token vive para sempre
             }
 
-            if first_run {
+            {
                 use tauri_plugin_autostart::ManagerExt;
-                let _ = app.autolaunch().enable();
+                let al = app.autolaunch();
+                // re-habilitar reescreve a chave do registro com os args atuais
+                // (--autostart), inclusive em quem já tinha o autostart de versões antigas
+                if first_run || al.is_enabled().unwrap_or(false) {
+                    let _ = al.enable();
+                }
             }
             // o hook de teclado troca perfil e mostra o balão: precisa do handle
             let _ = shared_setup.app.set(app.handle().clone());
@@ -1307,6 +1669,14 @@ pub fn run() {
                         return;
                     }
                     match event.id.as_ref() {
+                        "copy_last" => {
+                            let text = app.state::<Arc<Shared>>().last_text.lock().unwrap().clone();
+                            if !text.is_empty() {
+                                if let Ok(mut c) = arboard::Clipboard::new() {
+                                    let _ = c.set_text(text);
+                                }
+                            }
+                        }
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.show();

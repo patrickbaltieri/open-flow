@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  O binário gerado por `cargo test` não recebe o manifesto que o tauri-build
+  embute no app.exe. Sem ele o Windows carrega o comctl32 5.82, que não exporta
+  TaskDialogIndirect / SetWindowSubclass / DefSubclassProc / RemoveWindowSubclass,
+  e o processo morre no carregamento com STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)
+  antes de rodar qualquer teste.
+
+  Copiar este arquivo como "<binario-de-teste>.exe.manifest" resolve: o loader
+  do Windows honra manifesto externo quando não há um embutido.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="OpenFlow.Tests" version="1.0.0.0" processorArchitecture="amd64" />
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="amd64"
+        publicKeyToken="6595b64144ccf1df"
+        language="*" />
+    </dependentAssembly>
+  </dependency>
+</assembly>

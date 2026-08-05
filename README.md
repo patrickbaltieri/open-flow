@@ -29,9 +29,7 @@ de crédito) e do instalador.
 
 *Windows:*
 
-- Vá em [Releases — Windows (v0.1.5)](../../releases/tag/v0.1.5) e baixe o
-  `OpenFlow_0.1.5_x64-setup.exe` (a v0.1.6 é só do macOS; o instalador Windows mais recente
-  está na v0.1.5)
+- Vá em [Releases](../../releases/latest) e baixe o `OpenFlow_x.y.z_x64-setup.exe` mais recente
 - Execute. O Windows SmartScreen vai avisar que o app não é reconhecido (ele não tem assinatura
   digital paga): clique em **"Mais informações" → "Executar assim mesmo"**. O código-fonte
   completo está neste repositório para quem quiser auditar.
@@ -39,7 +37,8 @@ de crédito) e do instalador.
 
 *macOS (Apple Silicon):*
 
-- Vá em [Releases — macOS](../../releases/latest) e baixe o `OpenFlow_x.y.z_aarch64.dmg` mais recente
+- Vá em [Releases](../../releases) e baixe o `OpenFlow_x.y.z_aarch64.dmg` mais recente (as v0.1.8
+  e v0.1.9 corrigem bugs só do Windows e ainda não têm build do Mac: lá a atual é a v0.1.7)
 - Abra o DMG e arraste o Open Flow para **Aplicativos**
 - Na primeira abertura, o Gatekeeper vai bloquear (app sem assinatura paga da Apple): vá em
   **Ajustes → Privacidade e Segurança** e clique em **"Abrir Assim Mesmo"**
@@ -111,6 +110,10 @@ baixado automaticamente.
 [Inserção]  clipboard + Ctrl+V/Cmd+V sintético (com backup/restauração do clipboard)
 ```
 
+Durante a gravação o overlay mostra as ondas; ao soltar o atalho ele passa a três pontos
+("processando") e só some quando o texto entra. Se algo falhar no caminho, o motivo aparece
+ali mesmo em vez de sumir no console. `Esc` durante a gravação descarta o ditado.
+
 - **App**: Tauri 2 (Rust) + React/TypeScript — bandeja do sistema, overlay de ondas reativas
   ao microfone (2 estilos), janela de configurações com abas (Geral, Insights, Perfis,
   Dicionário, Snippets, Histórico, Diagnóstico), temas claro/escuro.
@@ -118,9 +121,10 @@ baixado automaticamente.
   GPU; morre junto com o app (vigia o PID pai) e recusa porta duplicada.
 - **Dados**: tudo local em `%APPDATA%\OpenFlow\` (Windows) ou
   `~/Library/Application Support/OpenFlow/` (Mac) — settings.json com as chaves, history.jsonl.
-  Histórico é desligável e apagável pela UI.
+  Histórico é desligável e apagável pela UI. No Windows as chaves são cifradas por usuário
+  (DPAPI, prefixo `enc:`); no Mac ficam em texto, protegidas pelas permissões do perfil.
 - **Plataformas**: mesmo código, com a camada específica isolada em
-  `app/src-tauri/src/platform/{windows,macos}.rs` (hook de teclado, cofre de chaves,
+  `app/src-tauri/src/platform/{windows,macos}.rs` (hook de teclado, proteção de chaves,
   atalho de colar, sidecar).
 
 ## Decisões de arquitetura e porquês
@@ -133,7 +137,9 @@ baixado automaticamente.
 | Tauri 2 em vez de Electron | Tray + overlay com ~11MB de exe e pouca RAM residente; UI em React/TS (stack já dominada). |
 | Hook de teclado de baixo nível próprio (WH_KEYBOARD_LL / CGEventTap) | Único jeito de detectar press-and-hold global (a API de hotkey comum não emite "soltou"). Suporta combos de modificadores e modo toggle. O rdev foi removido: chamava ToUnicode dentro do hook e consumia as dead keys (~/^) do teclado ABNT2. |
 | Inserção via clipboard+Ctrl+V/Cmd+V com restauração | Método mais compatível; fallback natural: o texto fica no clipboard se o app alvo bloquear paste (ex.: janelas elevadas/UIPI). |
-| Port macOS no mesmo repositório (`platform/` + `#[cfg]`) | Uma base de código, sem fork. Equivalências: DPAPI→Keychain, WH_KEYBOARD_LL→CGEventTap listen-only, Ctrl+V→Cmd+V com keycode cru. Atalho padrão do Mac é Ctrl+Option (Ctrl+Cmd foi descartado: Ctrl+Cmd+Q bloqueia a tela). |
+| Port macOS no mesmo repositório (`platform/` + `#[cfg]`) | Uma base de código, sem fork. Equivalências: WH_KEYBOARD_LL→CGEventTap listen-only, Ctrl+V→Cmd+V com keycode cru. Atalho padrão do Mac é Ctrl+Option (Ctrl+Cmd foi descartado: Ctrl+Cmd+Q bloqueia a tela). |
+| Sem Keychain no macOS (chaves em texto no settings.json) | A autorização de leitura de uma entrada do Keychain é amarrada ao hash do binário: todo rebuild assinado pedia a senha do keychain `login`, e quando essa senha diverge da senha da conta o app fica trancado fora das próprias chaves. São chaves de API free tier num app local — o Windows segue no DPAPI, que é transparente. |
+| Cancelar ditado no `Esc`, não no Espaço | O hook é listen-only por decisão de projeto, então o sistema recebe a combinação junto: com o atalho segurado, `Ctrl+Option+Espaço` (Mac) e `Win+Espaço` (Windows) trocam a fonte de entrada e mudam o layout do teclado no meio do ditado. |
 | Prompt de reescrita com regras invioláveis + perfil | Regras fixas (manter só a versão final das autocorreções, não inventar fatos) valem sempre; o perfil só muda o estilo (Jurídico formal, E-mail, WhatsApp, Roteiro, Bruto). |
 | Código fora do OneDrive (`C:\dev\open-flow`) | `target/` do Rust + `node_modules` em pasta sincronizada = builds lentos, conflitos de sync e locks de linker. |
 
@@ -184,6 +190,12 @@ Autostart: atalho para o exe em `shell:startup`.
 - **Port macOS**: a camada de plataforma foi isolada em `platform/{windows,macos}.rs` e o app
   passou a rodar nativo no Mac (Apple Silicon) — CGEventTap para o atalho, Keychain para as
   chaves, Cmd+V para inserção, ícone template na barra de menus, atalho padrão Ctrl+Option.
+- **Feedback e recuperação**: um grafo do repositório (graphify) mostrou que todo o valor do app
+  passa por `spawn_pipeline()` — e que ali nenhum erro tinha caminho de volta até o usuário.
+  Daí saíram: erros visíveis no overlay, estado "processando" até a inserção, cancelamento por
+  tecla, "Copiar último ditado" na bandeja, caminhos do sidecar editáveis na UI com o
+  Diagnóstico distinguindo "não configurado" de "descarregado", e busca do Histórico com espera.
+  O Keychain do macOS foi removido na mesma leva (ver decisões).
 
 Bugs memoráveis (e suas lições, gravadas como proteções no código):
 - Janela extra do Tauri v2 fora de `capabilities/default.json` → eventos negados em silêncio
@@ -199,6 +211,23 @@ Bugs memoráveis (e suas lições, gravadas como proteções no código):
   único Space por padrão (corrigido com `visibleOnAllWorkspaces` + collection behavior) e o
   App Nap suspendia o event tap quando não havia janela visível (corrigido com
   `NSProcessInfo beginActivityWithOptions`).
+- Tecla de cancelamento no Espaço trocou o layout ABNT2 no primeiro teste: com o atalho
+  segurado a combinação vira um atalho do sistema. Passou a ser `Esc`.
+- O normalizador da onda do overlay não pode ser zerado a cada gravação: sem calibração
+  anterior o ruído de fundo vira o máximo da escala e as ondas abrem sozinhas no silêncio.
+- No Windows o overlay sumia depois de um tempo de uso e só voltava reiniciando o app, com o
+  ditado funcionando normalmente. Duas tentativas erraram o alvo (reafirmar `always_on_top`,
+  depois reiniciar o loop de `requestAnimationFrame`) porque a hipótese era sempre "a janela
+  não aparece". Medir a janela pelo Win32 durante um ditado real desfez o engano: ela abria no
+  lugar certo, no topo, 380x44, e ficava 1,8s na tela — o que não acontecia era a **pintura**.
+  Esconder e reexibir a janela é o caminho defeituoso do WebView2; a janela passou a nascer
+  visível e nunca mais ser escondida (`overlay_hide` só emite evento), com o React apagando o
+  conteúdo. No macOS o mesmo ciclo sempre funcionou, e foi por isso que o bug era só do Windows.
+- A janela de configurações abria sozinha no boot: duas entradas de inicialização (a chave do
+  registro do `tauri-plugin-autostart` e um atalho manual em `shell:startup`) subiam duas
+  instâncias, e a segunda caía no callback do `single_instance`, cujo trabalho é justamente
+  mostrar a janela. O autostart passou a registrar `--autostart` e o callback ignora quem vem do
+  boot — abrir o app pela segunda vez a mão continua trazendo as configurações à frente.
 
 ## Pendências mapeadas
 
