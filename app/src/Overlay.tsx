@@ -4,6 +4,13 @@ import { listen } from "@tauri-apps/api/event";
 
 const W = 119;
 const H = 31;
+// respiro em volta da onda para o blur da sombra não ser cortado pela borda do
+// canvas (cabe na janela de 380x44 do overlay)
+const PAD = 6;
+// o clássico é 20% mais estreito que o tech: com a pílula preta atrás, a mesma
+// largura pesa demais na tela
+const CW = W * 0.8;
+const CX = (W - CW) / 2;
 const HIST = 48;
 // abaixo disto é ruído de fundo, não fala — mesmo limiar que o Rust usa para
 // descartar gravações sem voz (peak_rms < 0.006)
@@ -61,10 +68,12 @@ export default function Overlay() {
 
     const canvas = canvasRef.current!;
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = W * dpr;
-    canvas.height = H * dpr;
+    canvas.width = (W + PAD * 2) * dpr;
+    canvas.height = (H + PAD * 2) * dpr;
     const ctx = canvas.getContext("2d")!;
     ctx.scale(dpr, dpr);
+    ctx.translate(PAD, PAD);
+    const clear = () => ctx.clearRect(-PAD, -PAD, W + PAD * 2, H + PAD * 2);
 
     const hist = new Array<number>(HIST).fill(0);
     let env = 0;
@@ -101,12 +110,12 @@ export default function Overlay() {
       ctx.strokeStyle = "rgba(255, 255, 255, 0.9)";
       ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(0, mid);
-      ctx.lineTo(W, mid);
+      ctx.moveTo(CX, mid);
+      ctx.lineTo(CX + CW, mid);
       ctx.stroke();
       const nb = 23;
-      const x0 = W * 0.09;
-      const step = (W * 0.82) / (nb - 1);
+      const x0 = CX + CW * 0.09;
+      const step = (CW * 0.82) / (nb - 1);
       const bw = 2.6;
       for (let i = 0; i < nb; i++) {
         const v = hist[Math.floor((i / (nb - 1)) * (HIST - 1))];
@@ -137,7 +146,7 @@ export default function Overlay() {
       lastFrame = performance.now();
       // apagado: limpa e encerra o loop — nada é reagendado até o próximo ditado
       if (stateRef.current === "idle" || stateRef.current === "error") {
-        ctx.clearRect(0, 0, W, H);
+        clear();
         return;
       }
       if (reset.current) {
@@ -148,10 +157,26 @@ export default function Overlay() {
         // Zerá-lo faz o ruído de fundo saturar a escala e a onda abrir sozinha
         // no silêncio, que é o bug que já tinha sido corrigido uma vez.
       }
-      ctx.clearRect(0, 0, W, H);
-      ctx.shadowColor = "rgba(0, 0, 0, 0.9)";
-      ctx.shadowBlur = 5;
-      ctx.shadowOffsetY = 1.5;
+      clear();
+      if (style.current === "classic") {
+        // pílula cinza-escura translúcida — preto chapado ficava duro demais
+        // sobre o desktop. Borda nítida, sem blur.
+        // Com as barras sobre o fundo escuro a sombra sob os traços some.
+        ctx.shadowColor = "transparent";
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = "rgba(30, 30, 34, 0.78)";
+        const pw = (CW + PAD * 2) * 0.95;
+        const ph = (H + PAD * 2) * 0.81;
+        ctx.beginPath();
+        ctx.roundRect(W / 2 - pw / 2, mid - ph / 2, pw, ph, ph / 2);
+        ctx.fill();
+      } else {
+        // sem offset: deslocada para baixo com blur curto a sombra vira sublinhado.
+        // O blur não passa do PAD, senão a borda do canvas corta o degradê.
+        ctx.shadowColor = "rgba(0, 0, 0, 0.28)";
+        ctx.shadowBlur = 10;
+        ctx.shadowOffsetY = 0;
+      }
 
       if (stateRef.current === "processing") {
         drawProcessing();
@@ -219,8 +244,8 @@ export default function Overlay() {
         ref={canvasRef}
         style={{
           display: state === "recording" || state === "processing" ? "block" : "none",
-          width: `${W}px`,
-          height: `${H}px`,
+          width: `${W + PAD * 2}px`,
+          height: `${H + PAD * 2}px`,
         }}
       />
       {state === "error" && (
