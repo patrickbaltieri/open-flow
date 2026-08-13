@@ -37,6 +37,26 @@ struct Snippet {
     text: String,
 }
 
+/// Provedor de LLM que fala o dialeto OpenAI (`/models`, `/chat/completions`).
+/// Cobre Groq, OpenRouter, OmniRoute e o próprio Gemini pelo endpoint de
+/// compatibilidade — cada um verificado antes de generalizar.
+#[derive(Serialize, Deserialize, Clone, Default)]
+#[serde(default)]
+struct Provider {
+    /// apelido escolhido pelo usuário; é por ele que a escolha de modelo aponta
+    name: String,
+    /// endereço base, ex.: https://api.groq.com/openai/v1
+    base_url: String,
+    api_key: Option<String>,
+}
+
+impl Provider {
+    /// junta o caminho ao endereço base tolerando barra sobrando ou faltando
+    fn url(&self, caminho: &str) -> String {
+        format!("{}/{}", self.base_url.trim_end_matches('/'), caminho.trim_start_matches('/'))
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 struct Settings {
@@ -58,9 +78,18 @@ struct Settings {
     output_lang: String,
     gemini_model: String,
     gemini_api_key: Option<String>,
-    /// quem reescreve o texto: "gemini" ou "groq" (reaproveita a chave da transcrição)
+    /// legado: "gemini" ou "groq". Só vale quando `rewrite_provider_name` está vazio.
     rewrite_provider: String,
     groq_rewrite_model: String,
+    /// provedores cadastrados pelo usuário (aba Provedores)
+    providers: Vec<Provider>,
+    /// apelido do provedor usado na reescrita; vazio = comportamento legado
+    rewrite_provider_name: String,
+    rewrite_model: String,
+    /// apelido do provedor usado na transcrição; vazio = comportamento legado
+    /// (`stt_provider`, que continua valendo para o modo local)
+    stt_provider_name: String,
+    stt_model: String,
     wave_style: String,
     theme: String,
     profiles: Vec<Profile>,
@@ -142,6 +171,11 @@ impl Default for Settings {
             gemini_api_key: None,
             rewrite_provider: "gemini".into(),
             groq_rewrite_model: "llama-3.3-70b-versatile".into(),
+            providers: Vec::new(),
+            rewrite_provider_name: String::new(),
+            rewrite_model: String::new(),
+            stt_provider_name: String::new(),
+            stt_model: String::new(),
             wave_style: "tech".into(),
             theme: "dark".into(),
             profiles: default_profiles(),
@@ -213,11 +247,55 @@ fn encrypt_key(name: &str, v: &Option<String>) -> Option<String> {
     })
 }
 
+/// Primeira execução com a aba Provedores: transforma as chaves que já existiam
+/// em cartões, e aponta a reescrita para o provedor que estava em uso. Sem isto
+/// o usuário abriria a aba vazia e teria de recadastrar tudo à mão.
+fn migrate_providers(s: &mut Settings) {
+    if s.providers.is_empty() {
+        if s.groq_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false) {
+            s.providers.push(Provider {
+                name: "Groq".into(),
+                base_url: "https://api.groq.com/openai/v1".into(),
+                api_key: s.groq_api_key.clone(),
+            });
+        }
+        if s.gemini_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false) {
+            // endpoint de compatibilidade: o /chat/completions responde, mas o
+            // /models devolve 404 — a aba trata provedor sem catálogo
+            s.providers.push(Provider {
+                name: "Gemini".into(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                api_key: s.gemini_api_key.clone(),
+            });
+        }
+    }
+    if s.stt_provider_name.is_empty() && s.stt_provider == "groq" {
+        if let Some(p) = s.providers.iter().find(|p| p.name == "Groq") {
+            s.stt_provider_name = p.name.clone();
+            s.stt_model = s.groq_model.clone();
+        }
+    }
+    if s.rewrite_provider_name.is_empty() && !s.providers.is_empty() {
+        let (alvo, modelo) = if s.rewrite_provider == "groq" {
+            ("Groq", s.groq_rewrite_model.clone())
+        } else {
+            ("Gemini", s.gemini_model.clone())
+        };
+        if s.providers.iter().any(|p| p.name == alvo) {
+            s.rewrite_provider_name = alvo.into();
+            s.rewrite_model = modelo;
+        }
+    }
+}
+
 /// grava no disco com as chaves criptografadas (em memória ficam em texto)
 fn persist_settings(s: &Settings) -> Result<(), String> {
     let mut disk = s.clone();
     disk.gemini_api_key = encrypt_key("gemini_api_key", &disk.gemini_api_key);
     disk.groq_api_key = encrypt_key("groq_api_key", &disk.groq_api_key);
+    for p in &mut disk.providers {
+        p.api_key = encrypt_key("provider_api_key", &p.api_key);
+    }
     let path = settings_path();
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&path, serde_json::to_string_pretty(&disk).map_err(|e| e.to_string())?)
@@ -257,6 +335,10 @@ fn load_settings() -> (Settings, bool) {
                 }
                 s.gemini_api_key = decrypt_key("gemini_api_key", &s.gemini_api_key);
                 s.groq_api_key = decrypt_key("groq_api_key", &s.groq_api_key);
+                for p in &mut s.providers {
+                    p.api_key = decrypt_key("provider_api_key", &p.api_key);
+                }
+                migrate_providers(&mut s);
                 return (s, false);
             }
             Err(e) => {
@@ -526,6 +608,49 @@ fn ensure_sidecar(shared: &Shared, s: &Settings) -> Result<(), String> {
     Err("transcrição local não ficou pronta em 120s".into())
 }
 
+/// Transcrição por qualquer provedor com `/audio/transcriptions` no formato
+/// da OpenAI — mesmo multipart usado hoje com a Groq, só muda o endereço.
+fn transcribe_openai(
+    wav: Vec<u8>,
+    p: &Provider,
+    model: &str,
+    lang: &str,
+) -> Result<String, String> {
+    if model.trim().is_empty() {
+        return Err(format!("nenhum modelo de transcrição escolhido para '{}'", p.name));
+    }
+    let part = reqwest::blocking::multipart::Part::bytes(wav)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+    let mut form = reqwest::blocking::multipart::Form::new()
+        .part("file", part)
+        .text("model", model.to_string())
+        .text("response_format", "json");
+    if lang != "auto" {
+        form = form.text("language", lang.to_string());
+    }
+    let mut req = cloud_client()
+        .post(p.url("audio/transcriptions"))
+        .header("accept", "application/json")
+        .multipart(form);
+    if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().map_err(|e| format!("{}: {e}", p.name))?;
+    let status = resp.status();
+    let corpo = resp.text().map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&corpo)
+        .map_err(|_| format!("{} respondeu HTTP {status} sem JSON: {}", p.name, corta(&corpo)))?;
+    if let Some(msg) = v["error"]["message"].as_str() {
+        return Err(format!("{}: {msg}", p.name));
+    }
+    if !status.is_success() {
+        return Err(format!("{} respondeu HTTP {status}: {}", p.name, corta(&corpo)));
+    }
+    Ok(v["text"].as_str().unwrap_or("").trim().to_string())
+}
+
 fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
     let key = s.groq_api_key.clone().filter(|k| !k.is_empty()).ok_or("chave Groq ausente")?;
     let part = reqwest::blocking::multipart::Part::bytes(wav)
@@ -553,7 +678,22 @@ fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
 }
 
 fn run_stt(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, String> {
-    if s.stt_provider == "groq" && s.groq_ready() {
+    // provedor escolhido na aba Provedores tem prioridade
+    if !s.stt_provider_name.is_empty() {
+        match s.providers.iter().find(|p| p.name == s.stt_provider_name) {
+            Some(p) => match transcribe_openai(wav.clone(), p, &s.stt_model, &s.speech_lang) {
+                Ok(t) => {
+                    println!("[stt] transcrito via {} ({})", p.name, s.stt_model);
+                    return Ok(t);
+                }
+                Err(e) => eprintln!("[stt] {} falhou ({e}); tentando o local", p.name),
+            },
+            None => eprintln!(
+                "[stt] provedor '{}' não existe mais; tentando o local",
+                s.stt_provider_name
+            ),
+        }
+    } else if s.stt_provider == "groq" && s.groq_ready() {
         match transcribe_groq(wav.clone(), s) {
             Ok(t) => {
                 println!("[stt] transcrito via Groq (nuvem)");
@@ -616,10 +756,78 @@ fn build_prompt(s: &Settings, profile: &str) -> String {
 }
 
 fn rewrite(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
+    if !s.rewrite_provider_name.is_empty() {
+        match s.providers.iter().find(|p| p.name == s.rewrite_provider_name) {
+            Some(p) => return rewrite_openai(raw, s, profile, p, &s.rewrite_model),
+            // provedor removido sem trocar a seleção: avisa em vez de falhar calado
+            None => {
+                return Err(format!(
+                    "provedor '{}' não existe mais na aba Provedores",
+                    s.rewrite_provider_name
+                ))
+            }
+        }
+    }
     if s.rewrite_provider == "groq" {
         return rewrite_groq(raw, s, profile);
     }
     rewrite_gemini(raw, s, profile)
+}
+
+/// tira o bloco de raciocínio que alguns modelos devolvem antes da resposta
+fn sem_raciocinio(t: &str) -> &str {
+    match t.rsplit_once("</think>") {
+        Some((_, depois)) => depois,
+        None => t,
+    }
+}
+
+/// Reescrita por qualquer provedor compatível com a API da OpenAI.
+fn rewrite_openai(
+    raw: &str,
+    s: &Settings,
+    profile: &str,
+    p: &Provider,
+    model: &str,
+) -> Result<String, String> {
+    if model.trim().is_empty() {
+        return Err(format!("nenhum modelo escolhido para o provedor '{}'", p.name));
+    }
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.2,
+        // sem isto o OmniRoute responde em SSE e o corpo deixa de ser JSON
+        "stream": false,
+        "messages": [{"role": "user", "content": format!("{}{}", build_prompt(s, profile), raw)}]
+    });
+    let mut req = cloud_client()
+        .post(p.url("chat/completions"))
+        .header("accept", "application/json")
+        .json(&body);
+    if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().map_err(|e| format!("{} (reescrita): {e}", p.name))?;
+    let status = resp.status();
+    let corpo = resp.text().map_err(|e| e.to_string())?;
+    let v: serde_json::Value = serde_json::from_str(&corpo)
+        .map_err(|_| format!("{} respondeu HTTP {status} sem JSON: {}", p.name, corta(&corpo)))?;
+    if let Some(msg) = v["error"]["message"].as_str() {
+        return Err(format!("{} (reescrita): {msg}", p.name));
+    }
+    if !status.is_success() {
+        return Err(format!("{} respondeu HTTP {status}: {}", p.name, corta(&corpo)));
+    }
+    let text = sem_raciocinio(v["choices"][0]["message"]["content"].as_str().unwrap_or("")).trim();
+    if text.is_empty() {
+        return Err(format!("{} devolveu resposta vazia", p.name));
+    }
+    Ok(text.to_string())
+}
+
+fn corta(s: &str) -> String {
+    let limpo = s.replace('\n', " ");
+    limpo.chars().take(160).collect()
 }
 
 /// Reescrita pela Groq, com a mesma chave da transcrição. Latência bem mais
@@ -1187,6 +1395,191 @@ fn save_settings(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct ProviderTest {
+    ok: bool,
+    /// modelos do catálogo, ou vazio quando o provedor não expõe `/models`
+    models: Vec<String>,
+    /// mensagem para o usuário: quantos modelos, ou o motivo da falha
+    message: String,
+    /// provedor respondeu mas sem catálogo (Gemini é assim): o modelo vai na mão
+    no_catalog: bool,
+    /// tem `/audio/transcriptions`, ou seja, serve para transcrever
+    audio: bool,
+    /// subconjunto de `models` que o catálogo declara como transcrição
+    transcription_models: Vec<String>,
+    /// como esse subconjunto foi obtido, para a interface ser honesta
+    transcription_source: String,
+}
+
+/// O catálogo declara que este modelo transcreve?
+///
+/// Groq marca `output_modalities: ["transcription"]`; o OmniRoute usa
+/// `type: "audio"` com `subtype: "transcription"`. Só aceito esses dois sinais
+/// explícitos — "aceita áudio na entrada" não serve, porque no OpenRouter isso
+/// pega 25 modelos de chat multimodal que não atendem em /audio/transcriptions.
+fn declara_transcricao(m: &serde_json::Value) -> bool {
+    let saida_transcricao = m["output_modalities"]
+        .as_array()
+        .map(|a| a.iter().any(|x| x.as_str() == Some("transcription")))
+        .unwrap_or(false);
+    let tipo_audio = m["type"].as_str() == Some("audio")
+        && m["subtype"].as_str().map(|s| s.contains("transcri")).unwrap_or(false);
+    saida_transcricao || tipo_audio
+}
+
+/// Último recurso quando o catálogo não classifica nada: nome do modelo.
+fn parece_transcricao(id: &str) -> bool {
+    let s = id.to_lowercase();
+    ["whisper", "transcri", "speech-to-text", "voxtral", "-stt", "/stt"]
+        .iter()
+        .any(|p| s.contains(p))
+}
+
+/// Descobre se o provedor transcreve. Manda um multipart vazio de propósito:
+/// 404 significa que a rota não existe; qualquer outra resposta (tipicamente
+/// 400 reclamando do corpo) significa que existe. Não gasta tokens.
+fn probe_audio(p: &Provider) -> bool {
+    let mut req = cloud_client()
+        .post(p.url("audio/transcriptions"))
+        .multipart(reqwest::blocking::multipart::Form::new());
+    if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    match req.send() {
+        Ok(r) => r.status() != reqwest::StatusCode::NOT_FOUND,
+        Err(_) => false,
+    }
+}
+
+/// Testa a conexão e lista os modelos. Só roda quando o usuário clica —
+/// abrir a aba não gasta chamada de API.
+#[tauri::command]
+fn test_provider(base_url: String, api_key: Option<String>) -> ProviderTest {
+    let p = Provider { name: String::new(), base_url, api_key };
+    if p.base_url.trim().is_empty() {
+        return ProviderTest {
+            ok: false,
+            models: vec![],
+            message: "informe o endereço base".into(),
+            no_catalog: false,
+            audio: false,
+            transcription_models: vec![],
+            transcription_source: String::new(),
+        };
+    }
+    let mut req = cloud_client().get(p.url("models")).header("accept", "application/json");
+    if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
+        req = req.bearer_auth(k);
+    }
+    let resp = match req.send() {
+        Ok(r) => r,
+        Err(e) => {
+            return ProviderTest {
+                ok: false,
+                models: vec![],
+                message: format!("não consegui conectar: {e}"),
+                no_catalog: false,
+                audio: false,
+                transcription_models: vec![],
+                transcription_source: String::new(),
+            }
+        }
+    };
+    let status = resp.status();
+    let corpo = resp.text().unwrap_or_default();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return ProviderTest {
+            ok: true,
+            models: vec![],
+            message: "conectado, mas este provedor não publica catálogo — informe o modelo à mão".into(),
+            no_catalog: true,
+            audio: probe_audio(&p),
+            transcription_models: vec![],
+            transcription_source: "sem catálogo — informe o modelo à mão".into(),
+        };
+    }
+    if !status.is_success() {
+        let detalhe = serde_json::from_str::<serde_json::Value>(&corpo)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(|s| s.to_string()))
+            .unwrap_or_else(|| corta(&corpo));
+        return ProviderTest {
+            ok: false,
+            models: vec![],
+            message: format!("HTTP {status}: {detalhe}"),
+            no_catalog: false,
+            audio: false,
+            transcription_models: vec![],
+            transcription_source: String::new(),
+        };
+    }
+    let v: serde_json::Value = match serde_json::from_str(&corpo) {
+        Ok(v) => v,
+        Err(_) => {
+            return ProviderTest {
+                ok: false,
+                models: vec![],
+                message: format!("resposta não é JSON: {}", corta(&corpo)),
+                no_catalog: false,
+                audio: false,
+                transcription_models: vec![],
+                transcription_source: String::new(),
+            }
+        }
+    };
+    let itens = v["data"].as_array().cloned().unwrap_or_default();
+    let mut models: Vec<String> =
+        itens.iter().filter_map(|m| m["id"].as_str().map(|s| s.to_string())).collect();
+    models.sort();
+
+    // primeiro o que o catálogo declara; só se não declarar nada, cai no nome
+    let mut transcription_models: Vec<String> = itens
+        .iter()
+        .filter(|m| declara_transcricao(m))
+        .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+        .collect();
+    let mut transcription_source = "declarado pelo provedor".to_string();
+    if transcription_models.is_empty() {
+        transcription_models = models.iter().filter(|id| parece_transcricao(id)).cloned().collect();
+        transcription_source = if transcription_models.is_empty() {
+            "o catálogo não identifica modelos de transcrição".into()
+        } else {
+            "deduzido pelo nome — o catálogo não classifica".into()
+        };
+    }
+    transcription_models.sort();
+    if models.is_empty() {
+        return ProviderTest {
+            ok: true,
+            models,
+            message: "conectado, mas o catálogo veio vazio — informe o modelo à mão".into(),
+            no_catalog: true,
+            audio: probe_audio(&p),
+            transcription_models: vec![],
+            transcription_source: "sem catálogo — informe o modelo à mão".into(),
+        };
+    }
+    let audio = probe_audio(&p);
+    ProviderTest {
+        ok: true,
+        message: format!(
+            "conectado — {} modelos{}",
+            models.len(),
+            if audio {
+                format!(", {} de transcrição", transcription_models.len())
+            } else {
+                ", sem endpoint de transcrição".to_string()
+            }
+        ),
+        models,
+        no_catalog: false,
+        audio,
+        transcription_models,
+        transcription_source,
+    }
+}
+
 #[tauri::command]
 fn list_mics() -> Vec<String> {
     cpal::default_host()
@@ -1512,6 +1905,129 @@ mod tests {
     }
 
     #[test]
+    fn url_do_provedor_tolera_barra_sobrando_ou_faltando() {
+        let com = Provider { name: "x".into(), base_url: "https://a.b/v1/".into(), api_key: None };
+        let sem = Provider { name: "x".into(), base_url: "https://a.b/v1".into(), api_key: None };
+        assert_eq!(com.url("chat/completions"), "https://a.b/v1/chat/completions");
+        assert_eq!(sem.url("/chat/completions"), "https://a.b/v1/chat/completions");
+        assert_eq!(sem.url("models"), "https://a.b/v1/models");
+    }
+
+    #[test]
+    fn migracao_transforma_chaves_existentes_em_provedores() {
+        let mut s = Settings::default();
+        s.groq_api_key = Some("gsk_x".into());
+        s.gemini_api_key = Some("AQ.y".into());
+        s.rewrite_provider = "groq".into();
+        s.groq_rewrite_model = "llama-3.3-70b-versatile".into();
+        migrate_providers(&mut s);
+
+        assert_eq!(s.providers.len(), 2, "as duas chaves deviam virar cartões");
+        assert_eq!(s.rewrite_provider_name, "Groq", "manteve o provedor que estava em uso");
+        assert_eq!(s.rewrite_model, "llama-3.3-70b-versatile");
+        let groq = s.providers.iter().find(|p| p.name == "Groq").unwrap();
+        assert_eq!(groq.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(groq.api_key.as_deref(), Some("gsk_x"));
+    }
+
+    #[test]
+    fn migracao_aponta_a_transcricao_para_o_provedor_groq() {
+        let mut s = Settings::default();
+        s.groq_api_key = Some("gsk_x".into());
+        s.stt_provider = "groq".into();
+        s.groq_model = "whisper-large-v3-turbo".into();
+        migrate_providers(&mut s);
+        assert_eq!(s.stt_provider_name, "Groq");
+        assert_eq!(s.stt_model, "whisper-large-v3-turbo");
+    }
+
+    #[test]
+    fn quem_transcreve_no_local_nao_e_movido_para_a_nuvem() {
+        let mut s = Settings::default();
+        s.groq_api_key = Some("gsk_x".into());
+        s.stt_provider = "local".into();
+        migrate_providers(&mut s);
+        assert!(
+            s.stt_provider_name.is_empty(),
+            "modo local nao pode virar provedor de nuvem sozinho"
+        );
+    }
+
+    #[test]
+    fn migracao_nao_mexe_em_quem_ja_tem_provedores() {
+        let mut s = Settings::default();
+        s.groq_api_key = Some("gsk_x".into());
+        s.providers = vec![Provider {
+            name: "Meu gateway".into(),
+            base_url: "https://omniroute.exemplo/v1".into(),
+            api_key: Some("sk-1".into()),
+        }];
+        s.rewrite_provider_name = "Meu gateway".into();
+        s.rewrite_model = "algum/modelo".into();
+        migrate_providers(&mut s);
+
+        assert_eq!(s.providers.len(), 1, "não pode recriar provedor que o usuário removeu");
+        assert_eq!(s.rewrite_provider_name, "Meu gateway");
+    }
+
+    #[test]
+    fn sem_provedores_o_comportamento_legado_continua() {
+        let mut s = Settings::default();
+        migrate_providers(&mut s);
+        assert!(s.providers.is_empty());
+        assert!(s.rewrite_provider_name.is_empty(), "sem chave nenhuma, nada a migrar");
+    }
+
+    #[test]
+    fn classifica_modelo_de_transcricao_pelo_catalogo() {
+        // formatos reais, copiados da resposta de cada provedor
+        let groq_whisper = serde_json::json!({
+            "id": "whisper-large-v3-turbo",
+            "input_modalities": ["audio"], "output_modalities": ["transcription"]
+        });
+        let groq_chat = serde_json::json!({
+            "id": "llama-3.3-70b-versatile",
+            "input_modalities": ["text"], "output_modalities": ["text"]
+        });
+        let omni_whisper = serde_json::json!({
+            "id": "openrouter/openai/whisper-large-v3-turbo",
+            "type": "audio", "subtype": "transcription"
+        });
+        let omni_chat = serde_json::json!({
+            "id": "openrouter/google/gemini-3.5-flash-lite",
+            "input_modalities": ["text", "image"], "output_modalities": ["text"]
+        });
+        // chat multimodal do OpenRouter: aceita áudio, mas NÃO transcreve
+        let or_multimodal = serde_json::json!({
+            "id": "google/gemini-3.6-flash",
+            "architecture": { "input_modalities": ["text", "image", "audio"] }
+        });
+
+        assert!(declara_transcricao(&groq_whisper));
+        assert!(declara_transcricao(&omni_whisper));
+        assert!(!declara_transcricao(&groq_chat));
+        assert!(!declara_transcricao(&omni_chat));
+        assert!(
+            !declara_transcricao(&or_multimodal),
+            "aceitar áudio na entrada não é transcrever — isso arrastaria 25 modelos de chat"
+        );
+    }
+
+    #[test]
+    fn heuristica_de_nome_e_o_ultimo_recurso() {
+        assert!(parece_transcricao("openai/whisper-large-v3"));
+        assert!(parece_transcricao("mistralai/voxtral-mini-transcribe"));
+        assert!(!parece_transcricao("llama-3.3-70b-versatile"));
+        assert!(!parece_transcricao("gemini-3.5-flash-lite"));
+    }
+
+    #[test]
+    fn bloco_de_raciocinio_e_descartado() {
+        assert_eq!(sem_raciocinio("<think>penso muito</think>\nResposta final").trim(), "Resposta final");
+        assert_eq!(sem_raciocinio("Resposta direta"), "Resposta direta");
+    }
+
+    #[test]
     fn provedor_de_reescrita_migra_para_gemini() {
         let s: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(s.rewrite_provider, "gemini", "quem já usava não pode mudar de provedor sozinho");
@@ -1574,7 +2090,8 @@ pub fn run() {
             clear_history,
             get_diagnostics,
             get_autostart,
-            set_autostart
+            set_autostart,
+            test_provider
         ])
         .setup(move |app| {
             // app de bandeja: no mac o ícone vive só na menu bar, sem Dock

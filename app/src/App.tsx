@@ -22,6 +22,22 @@ export interface Snippet {
   text: string;
 }
 
+export interface Provider {
+  name: string;
+  base_url: string;
+  api_key: string | null;
+}
+
+interface ProviderTest {
+  ok: boolean;
+  models: string[];
+  message: string;
+  no_catalog: boolean;
+  audio: boolean;
+  transcription_models: string[];
+  transcription_source: string;
+}
+
 export interface Settings {
   hotkey: string;
   hotkey_toggle: string;
@@ -38,6 +54,11 @@ export interface Settings {
   gemini_api_key: string | null;
   rewrite_provider: string;
   groq_rewrite_model: string;
+  providers: Provider[];
+  rewrite_provider_name: string;
+  rewrite_model: string;
+  stt_provider_name: string;
+  stt_model: string;
   wave_style: string;
   theme: string;
   profiles: Profile[];
@@ -72,7 +93,7 @@ interface Diagnostics {
   recent: HistoryEntry[];
 }
 
-const TABS = ["Geral", "Insights", "Perfis", "Dicionário", "Snippets", "Histórico", "Diagnóstico", "Apoie"] as const;
+const TABS = ["Geral", "Provedores", "Insights", "Perfis", "Dicionário", "Snippets", "Histórico", "Diagnóstico", "Apoie"] as const;
 type Tab = (typeof TABS)[number];
 
 function App() {
@@ -159,6 +180,7 @@ function SettingsApp() {
       </aside>
       <main className="content">
         {tab === "Geral" && <GeneralTab s={settings} patch={patch} />}
+        {tab === "Provedores" && <ProvidersTab s={settings} patch={patch} />}
         {tab === "Insights" && <InsightsTab historyEnabled={settings.history_enabled} />}
         {tab === "Perfis" && <ProfilesTab s={settings} patch={patch} />}
         {tab === "Dicionário" && <DictTab s={settings} patch={patch} />}
@@ -443,32 +465,18 @@ function GeneralTab({ s, patch }: TabProps) {
         Quem converte sua fala em texto bruto. Se o provedor escolhido falhar (limite, sem
         chave, GPU ocupada), o outro assume automaticamente.
       </p>
-      <label className="field">
-        <span>Provedor</span>
-        <select
-          value={s.stt_provider}
-          onChange={(e) => patch({ stt_provider: e.target.value })}
-        >
-          <option value="groq">Groq (nuvem — rápido, libera a GPU)</option>
-          <option value="local">Local (GPU — privado, funciona offline)</option>
-        </select>
-        <small>
-          Com Groq como provedor, o modelo local não ocupa a GPU; ele só é carregado se o
-          fallback for necessário.
-        </small>
-      </label>
-      <label className="field">
-        <span>Chave da API Groq</span>
-        <SecretInput
-          value={s.groq_api_key ?? ""}
-          onChange={(v) => patch({ groq_api_key: v || null })}
-        />
-        <small>Grátis (~2.000 transcrições/dia): console.groq.com/keys</small>
-      </label>
-      <label className="field">
-        <span>Modelo de transcrição (Groq)</span>
-        <input value={s.groq_model} onChange={(e) => patch({ groq_model: e.target.value })} />
-      </label>
+      <ModelPicker
+        s={s}
+        patch={patch}
+        rotulo="Provedor da transcrição"
+        provedor={s.stt_provider_name}
+        modelo={s.stt_model}
+        aoTrocarProvedor={(v) => patch({ stt_provider_name: v, stt_model: "" })}
+        aoTrocarModelo={(v) => patch({ stt_model: v })}
+        opcaoVazia="— Local (GPU, sem nuvem) —"
+        somenteTranscricao
+        ajuda="Se o provedor escolhido falhar, o modo local assume automaticamente."
+      />
       <label className="field">
         <span>Python do modo local</span>
         <input value={s.python} onChange={(e) => patch({ python: e.target.value })} />
@@ -515,57 +523,274 @@ function GeneralTab({ s, patch }: TabProps) {
           Diferente do idioma da fala = o texto final sai traduzido (requer a chave Gemini).
         </small>
       </label>
+      <ModelPicker
+        s={s}
+        patch={patch}
+        rotulo="Provedor da reescrita"
+        provedor={s.rewrite_provider_name}
+        modelo={s.rewrite_model}
+        aoTrocarProvedor={(v) => patch({ rewrite_provider_name: v, rewrite_model: "" })}
+        aoTrocarModelo={(v) => patch({ rewrite_model: v })}
+        opcaoVazia="— nenhum (cola o texto bruto, sem reescrever) —"
+      />
+    </section>
+  );
+}
+
+/// Escolha de provedor + modelo, usada tanto pela transcrição quanto pela
+/// reescrita. Os modelos só são buscados quando o usuário clica, para não
+/// gastar chamada de API ao abrir a aba.
+function ModelPicker({
+  s,
+  rotulo,
+  provedor,
+  modelo,
+  aoTrocarProvedor,
+  aoTrocarModelo,
+  opcaoVazia,
+  somenteTranscricao,
+  ajuda,
+}: {
+  s: Settings;
+  patch: (p: Partial<Settings>) => void;
+  rotulo: string;
+  provedor: string;
+  modelo: string;
+  aoTrocarProvedor: (v: string) => void;
+  aoTrocarModelo: (v: string) => void;
+  opcaoVazia: string;
+  /// mostra só os modelos que o provedor declara como transcrição
+  somenteTranscricao?: boolean;
+  ajuda?: string;
+}) {
+  const [resultado, setResultado] = useState<ProviderTest | null>(null);
+  const [carregando, setCarregando] = useState(false);
+  const [verTodos, setVerTodos] = useState(false);
+  const atual = s.providers.find((p) => p.name === provedor);
+  const idLista = `modelos-${rotulo.replace(/\W+/g, "-")}`;
+
+  useEffect(() => {
+    setResultado(null);
+    setVerTodos(false);
+  }, [provedor]);
+
+  const carregar = async () => {
+    if (!atual) return;
+    setCarregando(true);
+    setResultado(
+      await invoke<ProviderTest>("test_provider", {
+        baseUrl: atual.base_url,
+        apiKey: atual.api_key,
+      })
+    );
+    setCarregando(false);
+  };
+
+  const filtrando = !!somenteTranscricao && !verTodos;
+  const modelos = !resultado
+    ? []
+    : filtrando
+      ? resultado.transcription_models
+      : resultado.models;
+
+  if (s.providers.length === 0) {
+    return (
+      <div className="field">
+        <span>{rotulo}</span>
+        <p className="hint">
+          Nenhum provedor cadastrado — vá na aba <b>Provedores</b> e adicione um.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <>
       <label className="field">
-        <span>Provedor da reescrita</span>
-        <select
-          value={s.rewrite_provider === "groq" ? "groq" : "gemini"}
-          onChange={(e) => patch({ rewrite_provider: e.target.value })}
-        >
-          <option value="gemini">Gemini (Google)</option>
-          <option value="groq">Groq — usa a mesma chave da transcrição</option>
+        <span>{rotulo}</span>
+        <select value={provedor} onChange={(e) => aoTrocarProvedor(e.target.value)}>
+          <option value="">{opcaoVazia}</option>
+          {s.providers.map((p) => (
+            <option key={p.name} value={p.name}>
+              {p.name}
+            </option>
+          ))}
         </select>
-        <small>
-          A Groq dispensa uma segunda chave e costuma responder em menos de 1s. O free tier do
-          Gemini não garante latência: pode ir de 0,5s a mais de 30s no mesmo dia.
-        </small>
+        <small>{ajuda ?? "Cadastre e remova provedores na aba Provedores."}</small>
       </label>
 
-      {s.rewrite_provider === "groq" ? (
+      {atual && (
         <label className="field">
-          <span>Modelo de reescrita (Groq)</span>
-          <input
-            list="groq-rewrite-models"
-            value={s.groq_rewrite_model}
-            onChange={(e) => patch({ groq_rewrite_model: e.target.value })}
-          />
-          <datalist id="groq-rewrite-models">
-            {["llama-3.3-70b-versatile", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.1-8b-instant"].map(
-              (m) => (
-                <option key={m} value={m} />
-              )
-            )}
-          </datalist>
-          <small>Limite do free tier: 1.000 requisições por dia, por modelo.</small>
-        </label>
-      ) : (
-        <>
-          <label className="field">
-            <span>Modelo de reescrita (Gemini)</span>
+          <span>Modelo</span>
+          <div className="modelo-linha">
             <input
-              value={s.gemini_model}
-              onChange={(e) => patch({ gemini_model: e.target.value })}
+              list={idLista}
+              value={modelo}
+              placeholder="digite ou carregue a lista"
+              onChange={(e) => aoTrocarModelo(e.target.value)}
             />
-          </label>
-          <label className="field">
-            <span>Chave da API Gemini</span>
-            <SecretInput
-              value={s.gemini_api_key ?? ""}
-              onChange={(v) => patch({ gemini_api_key: v || null })}
-            />
-            <small>Grátis: aistudio.google.com/apikey</small>
-          </label>
-        </>
+            <button onClick={carregar} disabled={carregando}>
+              {carregando ? "..." : "Carregar modelos"}
+            </button>
+          </div>
+          <datalist id={idLista}>
+            {modelos.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+          {!resultado && (
+            <small>Buscar a lista consome uma chamada da sua conta — só acontece no clique.</small>
+          )}
+          {resultado && (
+            <small>
+              {resultado.message}
+              {somenteTranscricao && resultado.transcription_source && (
+                <> · {resultado.transcription_source}</>
+              )}
+              {somenteTranscricao && resultado.models.length > 0 && (
+                <>
+                  {" · "}
+                  <button type="button" className="link" onClick={() => setVerTodos(!verTodos)}>
+                    {verTodos
+                      ? `só transcrição (${resultado.transcription_models.length})`
+                      : `ver todos (${resultado.models.length})`}
+                  </button>
+                </>
+              )}
+            </small>
+          )}
+        </label>
       )}
+    </>
+  );
+}
+
+const PRESETS: { name: string; base_url: string; nota: string }[] = [
+  { name: "Groq", base_url: "https://api.groq.com/openai/v1", nota: "console.groq.com/keys" },
+  { name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", nota: "openrouter.ai/keys" },
+  { name: "Gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", nota: "aistudio.google.com/apikey" },
+  { name: "OmniRoute", base_url: "https://omniroute.ihub.click/v1", nota: "seu gateway" },
+];
+
+function ProvidersTab({ s, patch }: TabProps) {
+  const [estado, setEstado] = useState<Record<number, { testando?: boolean; r?: ProviderTest }>>({});
+
+  const update = (i: number, p: Partial<Provider>) =>
+    patch({ providers: s.providers.map((pr, j) => (j === i ? { ...pr, ...p } : pr)) });
+
+  const remover = (i: number) => {
+    const alvo = s.providers[i];
+    const emUso = alvo.name === s.rewrite_provider_name;
+    if (emUso && !confirm(`"${alvo.name}" está em uso pela reescrita.\n\nRemovendo, o ditado passa a colar o texto bruto até você escolher outro provedor. Remover mesmo assim?`)) {
+      return;
+    }
+    patch({
+      providers: s.providers.filter((_, j) => j !== i),
+      ...(emUso ? { rewrite_provider_name: "", rewrite_model: "" } : {}),
+    });
+    setEstado({});
+  };
+
+  const testar = async (i: number) => {
+    const p = s.providers[i];
+    setEstado((e) => ({ ...e, [i]: { testando: true } }));
+    const r = await invoke<ProviderTest>("test_provider", {
+      baseUrl: p.base_url,
+      apiKey: p.api_key,
+    });
+    setEstado((e) => ({ ...e, [i]: { r } }));
+  };
+
+  const adicionar = (preset?: (typeof PRESETS)[number]) => {
+    const base = preset ?? { name: "Novo provedor", base_url: "" };
+    let nome = base.name;
+    for (let n = 2; s.providers.some((p) => p.name === nome); n++) {
+      nome = `${base.name} ${n}`;
+    }
+    patch({ providers: [...s.providers, { name: nome, base_url: base.base_url, api_key: null }] });
+  };
+
+  return (
+    <section>
+      <h1>Provedores</h1>
+      <p className="hint">
+        Qualquer serviço compatível com a API da OpenAI serve — basta o endereço base e a chave.
+        O botão <b>Testar</b> conecta e lista os modelos disponíveis; é a única hora em que o app
+        consome uma chamada da sua conta.
+      </p>
+
+      {s.providers.length === 0 && (
+        <p className="hint">Nenhum provedor cadastrado. A reescrita está usando o modo antigo.</p>
+      )}
+
+      {s.providers.map((p, i) => {
+        const st = estado[i];
+        const emUso = p.name === s.rewrite_provider_name;
+        return (
+          <div key={i} className={`card ${emUso ? "card-active" : ""}`}>
+            <div className="card-head">
+              <input
+                className="card-title"
+                value={p.name}
+                placeholder="apelido"
+                onChange={(e) => {
+                  const antigo = p.name;
+                  update(i, { name: e.target.value });
+                  if (s.rewrite_provider_name === antigo) {
+                    patch({ rewrite_provider_name: e.target.value });
+                  }
+                }}
+              />
+              {emUso && <span className="badge-uso">reescrita</span>}
+              <button onClick={() => testar(i)} disabled={st?.testando}>
+                {st?.testando ? "testando..." : "Testar"}
+              </button>
+              <button className="danger" onClick={() => remover(i)}>
+                remover
+              </button>
+            </div>
+
+            <label className="field">
+              <span>Endereço base</span>
+              <input
+                value={p.base_url}
+                placeholder="https://exemplo.com/v1"
+                onChange={(e) => update(i, { base_url: e.target.value })}
+              />
+            </label>
+
+            <label className="field">
+              <span>Chave da API</span>
+              <SecretInput
+                value={p.api_key ?? ""}
+                onChange={(v) => update(i, { api_key: v || null })}
+              />
+            </label>
+
+            {st?.r && (
+              <p className={st.r.ok ? "prov-ok" : "prov-erro"}>
+                {st.r.ok ? "✓ " : "✗ "}
+                {st.r.message}
+              </p>
+            )}
+            {st?.r?.models && st.r.models.length > 0 && (
+              <details className="prov-modelos">
+                <summary>ver modelos ({st.r.models.length})</summary>
+                <div>{st.r.models.join("  ·  ")}</div>
+              </details>
+            )}
+          </div>
+        );
+      })}
+
+      <div className="prov-add">
+        <button onClick={() => adicionar()}>+ Adicionar provedor</button>
+        {PRESETS.filter((p) => !s.providers.some((x) => x.base_url === p.base_url)).map((p) => (
+          <button key={p.name} className="preset" onClick={() => adicionar(p)} title={p.nota}>
+            + {p.name}
+          </button>
+        ))}
+      </div>
     </section>
   );
 }

@@ -262,6 +262,89 @@ button.danger:hover {
   color: var(--text);
 }
 
+.badge-uso {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.15rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.prov-ok,
+.prov-erro {
+  font-size: 0.86rem;
+  margin: 0.5rem 0 0;
+}
+
+.prov-ok {
+  color: #4ade80;
+}
+
+.prov-erro {
+  color: #f87171;
+}
+
+.prov-modelos {
+  margin-top: 0.4rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.prov-modelos summary {
+  cursor: pointer;
+}
+
+.prov-modelos div {
+  max-height: 8rem;
+  overflow-y: auto;
+  margin-top: 0.4rem;
+  line-height: 1.6;
+  word-break: break-all;
+}
+
+.prov-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.prov-add .preset {
+  opacity: 0.75;
+  font-size: 0.85rem;
+}
+
+.prov-add .preset:hover {
+  opacity: 1;
+}
+
+button.link {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+button.link:hover {
+  background: none;
+  opacity: 0.8;
+}
+
+.modelo-linha {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.modelo-linha button {
+  white-space: nowrap;
+}
+
 .hotkey-input {
   position: relative;
 }
