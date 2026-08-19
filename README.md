@@ -37,8 +37,9 @@ de crédito) e do instalador.
 
 *macOS (Apple Silicon):*
 
-- Vá em [Releases](../../releases) e baixe o `OpenFlow_x.y.z_aarch64.dmg` mais recente (as v0.1.8
-  e v0.1.9 corrigem bugs só do Windows e não têm build do Mac; da v0.1.10 em diante o DMG voltou)
+- Vá em [Releases](../../releases/latest) e baixe o `OpenFlow_x.y.z_aarch64.dmg` mais recente
+  (as v0.1.8 e v0.1.9 corrigem bugs só do Windows e não têm build do Mac; da v0.1.10 em diante
+  o DMG voltou)
 - Abra o DMG e arraste o Open Flow para **Aplicativos**
 - Na primeira abertura, o Gatekeeper vai bloquear (app sem assinatura paga da Apple): vá em
   **Ajustes → Privacidade e Segurança** e clique em **"Abrir Assim Mesmo"**
@@ -105,7 +106,8 @@ baixado automaticamente.
                      ⇅ fallback automático bidirecional
                      faster-whisper large-v3-turbo local (GPU, sidecar Python residente)
         texto bruto ↓
-[Reescrita]  Gemini Flash (free tier) + regras fixas + dicionário + perfil de escrita ativo
+[Reescrita]  Gemini Flash Lite (free tier, com fallback de modelo) + regras de edição
+             + dicionário + perfil de escrita ativo
         texto final ↓
 [Inserção]  clipboard + Ctrl+V/Cmd+V sintético (com backup/restauração do clipboard)
 ```
@@ -132,7 +134,7 @@ ali mesmo em vez de sumir no console. `Esc` durante a gravação descarta o dita
 | Decisão | Por quê |
 |---|---|
 | STT híbrido nuvem+local (Groq padrão, local fallback) | Groq free tier (~2.000/dia) libera a GPU e dá boot instantâneo; o local garante offline e privacidade total quando escolhido. Fallback automático nos dois sentidos. |
-| Reescrita no Gemini Flash free tier | Menor latência (~1s) e custo zero via API oficial. Sem chave, o app degrada para texto bruto corrigido pelo próprio Whisper. |
+| Reescrita no Gemini Flash Lite free tier | Menor latência (~1,4s medidos no `gemini-3.5-flash-lite`) e custo zero via API oficial. Sem chave, o app degrada para texto bruto corrigido pelo próprio Whisper. A classe *lite* é deliberada: editar transcrição é trabalho leve, e modelo maior custa espera e tende a reescrever mais do que se pede. |
 | Não usar conta ChatGPT Plus como "API" | Não existe ponte legítima Plus→API; automação do ChatGPT web viola ToS e quebra fácil. Caminhos oficiais mapeados (Codex CLI, Claude CLI) ficam como providers futuros. |
 | Tauri 2 em vez de Electron | Tray + overlay com ~11MB de exe e pouca RAM residente; UI em React/TS (stack já dominada). |
 | Hook de teclado de baixo nível próprio (WH_KEYBOARD_LL / CGEventTap) | Único jeito de detectar press-and-hold global (a API de hotkey comum não emite "soltou"). Suporta combos de modificadores e modo toggle. O rdev foi removido: chamava ToUnicode dentro do hook e consumia as dead keys (~/^) do teclado ABNT2. |
@@ -140,7 +142,9 @@ ali mesmo em vez de sumir no console. `Esc` durante a gravação descarta o dita
 | Port macOS no mesmo repositório (`platform/` + `#[cfg]`) | Uma base de código, sem fork. Equivalências: WH_KEYBOARD_LL→CGEventTap listen-only, Ctrl+V→Cmd+V com keycode cru. Atalho padrão do Mac é Ctrl+Option (Ctrl+Cmd foi descartado: Ctrl+Cmd+Q bloqueia a tela). |
 | Sem Keychain no macOS (chaves em texto no settings.json) | A autorização de leitura de uma entrada do Keychain é amarrada ao hash do binário: todo rebuild assinado pedia a senha do keychain `login`, e quando essa senha diverge da senha da conta o app fica trancado fora das próprias chaves. São chaves de API free tier num app local — o Windows segue no DPAPI, que é transparente. |
 | Cancelar ditado no `Esc`, não no Espaço | O hook é listen-only por decisão de projeto, então o sistema recebe a combinação junto: com o atalho segurado, `Ctrl+Option+Espaço` (Mac) e `Win+Espaço` (Windows) trocam a fonte de entrada e mudam o layout do teclado no meio do ditado. |
-| Prompt de reescrita com regras invioláveis + perfil | Regras fixas (manter só a versão final das autocorreções, não inventar fatos) valem sempre; o perfil só muda o estilo (Jurídico formal, E-mail, WhatsApp, Roteiro, Bruto). |
+| Prompt de reescrita em duas camadas (invioláveis + padrão conservador + perfil) | Chamar tudo de "inviolável" engessava o texto: as regras vinham antes do estilo e nenhum perfil conseguia afrouxá-las, então repetição intencional virava erro e a fala voltava mais formal do que saiu. Hoje só três coisas são absolutas (não inventar, não resumir, não omitir); a edição é conservadora por padrão — preserva palavras, trata repetição como ênfase, descarta apenas retratação explícita — e o `Estilo:` do perfil, que vem por último, pode pedir mais liberdade (o de e-mail reescreve e quebra em linhas). |
+| Estrutura decidida pela fala, não pelo perfil | Ditar uma resposta e receber um bloco único é ruim, mas obrigar tópicos é pior. A regra pede parágrafos quando o assunto muda e numeração quando o falante enumera — e manda deixar em paz quando a fala foi um bloco só. Colocar isso no perfil exigiria trocar de perfil a cada ditado; na regra global vale para todos. |
+| Modelo do Gemini com fallback automático | O acesso a modelos varia por conta e projeto, então o modelo mais rápido para um usuário pode não existir para outro. O app tenta o configurado e cai para o `gemini-3.1-flash-lite` em 404/503, travando a escolha após o primeiro fallback para não pagar uma chamada perdida por ditado. |
 | Código fora do OneDrive (`C:\dev\open-flow`) | `target/` do Rust + `node_modules` em pasta sincronizada = builds lentos, conflitos de sync e locks de linker. |
 
 ## Rodando do zero
@@ -196,6 +200,33 @@ Autostart: atalho para o exe em `shell:startup`.
   tecla, "Copiar último ditado" na bandeja, caminhos do sidecar editáveis na UI com o
   Diagnóstico distinguindo "não configurado" de "descarregado", e busca do Histórico com espera.
   O Keychain do macOS foi removido na mesma leva (ver decisões).
+- **Edição sutil (v0.1.13)**: o prompt corrigia demais. Repetir uma palavra de propósito era
+  tratado como erro, "quer dizer" e "tipo" contavam como autocorreção e o texto voltava
+  reescrito num registro mais formal que o falado. A causa era estrutural: as regras se
+  chamavam "invioláveis" e vinham antes do estilo do perfil, então nenhum perfil conseguia
+  afrouxá-las. O prompt passou a ter duas camadas — invioláveis de verdade (não inventar, não
+  resumir, não omitir) e um padrão de edição conservador que o `Estilo:` do perfil pode
+  relaxar. Repetição virou ênfase a preservar, descarte só vale em retratação explícita
+  ("não, na verdade é X") e a estrutura passou a seguir a fala: parágrafos quando o assunto
+  muda, numeração quando o falante enumera, bloco único quando foi um bloco só.
+- **O tempo estava no Gemini (v0.1.13)**: o histórico em JSONL já cronometrava as duas etapas, e
+  os 665 ditados acumulados responderam sozinhos — 63% da espera era do Gemini, com custo fixo
+  de 1,89s contra 0,28s por 100 caracteres gerados. Ou seja: quase tudo era latência de modelo,
+  não volume de texto. Medir os modelos disponíveis para a mesma chave mostrou o
+  `gemini-3.5-flash-lite` com 1,44s de média contra 5,54s do `3.1-flash-lite` — a mesma classe
+  de modelo, uma geração à frente, quase 4x mais rápido. Como o acesso a modelos varia por
+  conta e projeto, o app tenta o modelo configurado e cai para o `3.1-flash-lite` em 404 ou 503,
+  travando a escolha depois do primeiro fallback para não pagar uma chamada perdida por ditado.
+- **Estrutura deixou de ser adivinhada (v0.1.14)**: a regra de estrutura da v0.1.13 pedia
+  julgamento ("quebre quando o assunto muda") e vinha logo depois de duas travas conservadoras,
+  então em fala curta as travas venciam: cinco ditados de teste com "primeiro… segundo…
+  terceiro" dito em voz alta voltaram como bloco corrido. A regra passou a tratar marca falada
+  como instrução, não como licença para reformatar, e ganhou um teto mecânico — acima de ~400
+  caracteres o texto nunca sai em bloco único, com parágrafos de no máximo 4 frases. O teto foi
+  necessário porque a versão só com "quebre onde o foco muda" falhava justamente no caso mais
+  longo (943 caracteres sobre um assunto só): sem critério objetivo, o modelo conclui que não
+  há virada e devolve o bloco. Validação nos ditados reais já gravados no `history.jsonl`, sem
+  precisar ditar de novo — o histórico serve de suíte de regressão para prompt.
 
 Bugs memoráveis (e suas lições, gravadas como proteções no código):
 - Janela extra do Tauri v2 fora de `capabilities/default.json` → eventos negados em silêncio
@@ -215,6 +246,13 @@ Bugs memoráveis (e suas lições, gravadas como proteções no código):
   segurado a combinação vira um atalho do sistema. Passou a ser `Esc`.
 - O normalizador da onda do overlay não pode ser zerado a cada gravação: sem calibração
   anterior o ruído de fundo vira o máximo da escala e as ondas abrem sozinhas no silêncio.
+- "Legenda Adriana Zanotto" aparecia no fim do texto em ~3% dos ditados: o Whisper foi treinado
+  em legendas e assina a transcrição quando o áudio termina em silêncio. Não é corrigível no
+  prompt — a primeira regra manda não omitir conteúdo, então o Gemini preserva a assinatura
+  fielmente. A limpeza virou código na saída do STT (`strip_credit`), cortando só a cauda depois
+  do último fim de frase: "legenda" no meio da fala é palavra legítima do falante e não pode
+  sumir. O ponto de "Amara.org" quase quebrou a regra ao passar por fim de frase — fim de frase
+  exige pontuação seguida de espaço.
 - No Windows o overlay sumia depois de um tempo de uso e só voltava reiniciando o app, com o
   ditado funcionando normalmente. Duas tentativas erraram o alvo (reafirmar `always_on_top`,
   depois reiniciar o loop de `requestAnimationFrame`) porque a hipótese era sempre "a janela
@@ -223,6 +261,14 @@ Bugs memoráveis (e suas lições, gravadas como proteções no código):
   Esconder e reexibir a janela é o caminho defeituoso do WebView2; a janela passou a nascer
   visível e nunca mais ser escondida (`overlay_hide` só emite evento), com o React apagando o
   conteúdo. No macOS o mesmo ciclo sempre funcionou, e foi por isso que o bug era só do Windows.
+- No Mac o modo press-and-hold parou de soltar: o ditado começava no atalho e só o Esc encerrava.
+  Modificador não emite `KeyUp` no macOS — só `FlagsChanged`, que não diz por si se foi aperto ou
+  soltura —, e o código resolvia isso perguntando o estado físico da tecla ao sistema
+  (`CGEventSourceKeyState`). Essa consulta corre com a entrega do evento: na soltura ela ainda
+  respondia "pressionado", a tecla nunca saía do conjunto e o Stop jamais disparava. O estado
+  passou a ser lido da flag do próprio evento, que é determinística e chega junto com ele. O bug
+  existia desde o port, mas só apareceu quando o timing mudou — binário recém-instalado é novo
+  para o sistema.
 - A janela de configurações abria sozinha no boot: duas entradas de inicialização (a chave do
   registro do `tauri-plugin-autostart` e um atalho manual em `shell:startup`) subiam duas
   instâncias, e a segunda caía no callback do `single_instance`, cujo trabalho é justamente

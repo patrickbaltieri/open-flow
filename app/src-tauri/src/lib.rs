@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,10 +15,13 @@ use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 mod platform;
 
 const RULES: &str = "Você é um editor de ditado. Receberá a transcrição literal de uma fala em pt-BR.\n\
-Regras invioláveis:\n\
-1. Quando o falante se corrige (\"não, melhor...\", \"deixa eu corrigir...\", \"quer dizer...\"), mantenha APENAS a versão final e descarte a descartada.\n\
-2. Remova hesitações, muletas (\"é...\", \"tipo\", \"então...\") e repetições.\n\
-3. Corrija concordância e pontuação. NÃO adicione fatos, NÃO resuma, NÃO omita conteúdo.\n";
+Invioláveis: NÃO adicione fatos, NÃO resuma, NÃO omita conteúdo.\n\
+Edição — padrão conservador; o Estilo no fim pode pedir mais liberdade:\n\
+1. Preserve as palavras do falante. Não troque expressões por sinônimos mais formais, não reordene nem reescreva frases que já se entendem. Corrija apenas ortografia, concordância e pontuação.\n\
+2. Repetição de palavra ou frase é ênfase do falante: MANTENHA. Remova só hesitações e falsos inícios (\"é...\", \"hum\", \"a-a-a\").\n\
+3. Descarte a versão anterior apenas quando o falante se retrata de forma explícita (\"não, na verdade é X\", \"me corrigindo, são 30\"). Conectores como \"quer dizer\", \"tipo\" e \"então\" sozinhos NÃO são correção.\n\
+4. Estrutura: quando o falante marca a virada em voz alta, obedeça — é instrução, não licença para reformatar. \"outra coisa\", \"outro assunto\", \"mudando de assunto\", \"agora\" abrindo tema novo: parágrafo novo (linha em branco). \"primeiro/segundo/terceiro\", \"três coisas que eu queria\": uma linha por item, numerada. Isso vale igual em fala curta. Sem marca falada, entregue um bloco só: não force formato nem crie tópicos por conta própria.\n\
+5. Fala longa (acima de ~400 caracteres) nunca sai em bloco único, mesmo que trate de um assunto só: divida em parágrafos de no máximo 4 frases, cortando no ponto final mais próximo da virada de foco.\n";
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(default)]
@@ -110,9 +113,9 @@ fn default_profiles() -> Vec<Profile> {
         hotkey_mode: "hold".into(),
     };
     vec![
-        p("Bruto corrigido", "texto natural corrigido, mantendo o tom do falante."),
+        p("Bruto corrigido", "coringa do dia a dia (resposta de conversa, WhatsApp, prompt para IA): texto natural com o tom e as palavras do falante preservados."),
         p("Jurídico formal", "certidão ou comunicação de oficial de justiça, linguagem jurídica formal brasileira (ex.: \"Certifico e dou fé que...\", \"genitor\", \"Ante o exposto, devolvo o presente mandado\")."),
-        p("E-mail profissional", "e-mail profissional claro e cordial, com saudação e fecho quando fizer sentido."),
+        p("E-mail profissional", "e-mail profissional claro e cordial, com saudação e fecho quando fizer sentido. Aqui pode reescrever para deixar formal: cada ideia em sua própria linha, separadas por linha em branco, no padrão corporativo."),
         p("WhatsApp curto", "mensagem curta e informal de WhatsApp, direta, sem formalidade excessiva."),
         p("Roteiro de vídeo", "roteiro falado para vídeo do YouTube: frases curtas, ritmo de fala natural, tom de conversa."),
     ]
@@ -167,7 +170,7 @@ impl Default for Settings {
             groq_model: "whisper-large-v3-turbo".into(),
             speech_lang: "pt".into(),
             output_lang: "same".into(),
-            gemini_model: "gemini-3.1-flash-lite".into(),
+            gemini_model: "gemini-3.5-flash-lite".into(),
             gemini_api_key: None,
             rewrite_provider: "gemini".into(),
             groq_rewrite_model: "llama-3.3-70b-versatile".into(),
@@ -531,7 +534,11 @@ fn is_hallucination(text: &str, audio_secs: f32) -> bool {
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
-    matches!(norm.trim(), "e aí" | "eaí" | "obrigado" | "obrigada" | "tchau" | "valeu" | "thank you")
+    let norm = norm.trim();
+    // sem frase anterior para servir de âncora, a assinatura de legenda vem
+    // sozinha e o strip_credit não a alcança (histórico: 0,8s de áudio)
+    norm.starts_with("legenda")
+        || matches!(norm, "e aí" | "eaí" | "obrigado" | "obrigada" | "tchau" | "valeu" | "thank you")
 }
 
 fn wav_bytes(samples: &[f32], rate: u32) -> Vec<u8> {
@@ -677,7 +684,45 @@ fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
     Ok(v["text"].as_str().unwrap_or("").trim().to_string())
 }
 
+/// O Whisper foi treinado em legendas e às vezes assina o fim da transcrição:
+/// "Legenda Adriana Zanotto", "Legendas pela comunidade Amara.org". Não dá para
+/// resolver no prompt — as regras mandam NÃO omitir conteúdo, então o Gemini
+/// preserva a assinatura fielmente e ela cai no campo do usuário. 8 dos 282
+/// ditados do histórico vieram assim, sempre coladas depois da última frase.
+///
+/// Só corta a cauda depois do último ponto final: "legenda" no meio da fala é
+/// palavra legítima do falante (aparece no histórico em "com título, legenda,
+/// nome das variáveis") e não pode sumir.
+fn strip_credit(text: &str) -> &str {
+    const MARCAS: [&str; 3] = ["legenda", "legendado", "subtitle"];
+    let t = text.trim_end();
+    let corpo = t.trim_end_matches(['.', '!', '?', ' ']);
+    // fim de frase é pontuação seguida de espaço: o ponto de "Amara.org" não conta
+    let Some(i) = corpo
+        .char_indices()
+        .filter(|(j, c)| {
+            matches!(c, '.' | '!' | '?' | '\n')
+                && corpo[j + c.len_utf8()..].chars().next().map_or(true, char::is_whitespace)
+        })
+        .map(|(j, _)| j)
+        .next_back()
+    else {
+        return t;
+    };
+    let cauda = corpo[i + 1..].trim().to_lowercase();
+    let curta = cauda.split_whitespace().count() <= 5;
+    if curta && (MARCAS.iter().any(|m| cauda.starts_with(m)) || cauda.contains("amara.org")) {
+        return t[..=i].trim_end();
+    }
+    t
+}
+
 fn run_stt(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, String> {
+    // os dois provedores rodam Whisper, então os dois assinam legenda
+    stt_provider(wav, shared, s).map(|t| strip_credit(&t).to_string())
+}
+
+fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, String> {
     // provedor escolhido na aba Provedores tem prioridade
     if !s.stt_provider_name.is_empty() {
         match s.providers.iter().find(|p| p.name == s.stt_provider_name) {
@@ -737,7 +782,7 @@ fn build_prompt(s: &Settings, profile: &str) -> String {
     let mut p = RULES.to_string();
     let dict: Vec<&str> = s.dictionary.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
     if !dict.is_empty() {
-        p.push_str(&format!("4. Grafias obrigatórias quando essas palavras aparecerem: {}.\n", dict.join(", ")));
+        p.push_str(&format!("6. Grafias obrigatórias quando essas palavras aparecerem: {}.\n", dict.join(", ")));
     }
     p.push_str("Responda SOMENTE com o texto final, sem comentários.\n");
     if s.output_lang != "same" && s.output_lang != s.speech_lang {
@@ -809,6 +854,17 @@ fn rewrite_openai(
     }
     let resp = req.send().map_err(|e| format!("{} (reescrita): {e}", p.name))?;
     let status = resp.status();
+    // mesmo remédio do caminho nativo do Gemini: modelo que sumiu da conta (404)
+    // ou saturado (503) troca pelo de reserva em vez de devolver texto cru.
+    // Só no Gemini — nos demais provedores o modelo de reserva não existiria.
+    if (status.as_u16() == 404 || status.as_u16() == 503)
+        && p.base_url.contains("generativelanguage.googleapis.com")
+        && model != FALLBACK_MODEL
+    {
+        eprintln!("[{}] {model} indisponível (HTTP {status}); usando {FALLBACK_MODEL}", p.name);
+        USE_FALLBACK.store(true, Ordering::Relaxed);
+        return rewrite_openai(raw, s, profile, p, FALLBACK_MODEL);
+    }
     let corpo = resp.text().map_err(|e| e.to_string())?;
     let v: serde_json::Value = serde_json::from_str(&corpo)
         .map_err(|_| format!("{} respondeu HTTP {status} sem JSON: {}", p.name, corta(&corpo)))?;
@@ -862,6 +918,57 @@ fn rewrite_groq(raw: &str, s: &Settings, profile: &str) -> Result<String, String
     Ok(text.trim().to_string())
 }
 
+/// Modelo de reserva: o acesso a modelos varia por conta/projeto, então a chave
+/// de outro usuário pode não ter o modelo configurado (404) ou vê-lo saturado
+/// (503). Cair aqui é melhor que devolver a transcrição crua.
+const FALLBACK_MODEL: &str = "gemini-3.1-flash-lite";
+/// Travado depois do primeiro 404/503: sem isso, uma conta sem o modelo
+/// preferido pagaria uma chamada perdida em TODO ditado.
+static USE_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+fn modelo_efetivo(configurado: &str) -> &str {
+    if USE_FALLBACK.load(Ordering::Relaxed) {
+        FALLBACK_MODEL
+    } else {
+        configurado
+    }
+}
+
+/// Err traz o status HTTP (0 = falha de rede) para separar "esse modelo não
+/// serve para esta chave" de "a internet caiu".
+fn call_gemini(model: &str, key: &str, prompt: &str) -> Result<String, (u16, String)> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| (0, e.to_string()))?;
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+    );
+    let body = serde_json::json!({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.2}
+    });
+    let resp = client
+        .post(url)
+        .json(&body)
+        .send()
+        .map_err(|e| (0, format!("Gemini: {e}")))?;
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        return Err((status, format!("Gemini {model}: HTTP {status}")));
+    }
+    let v: serde_json::Value = resp.json().map_err(|e| (status, e.to_string()))?;
+    let parts = &v["candidates"][0]["content"]["parts"];
+    let text = parts
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join(""))
+        .unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err((status, format!("resposta vazia do Gemini: {v}")));
+    }
+    Ok(text.trim().to_string())
+}
+
 fn rewrite_gemini(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
     let key = s
         .gemini_api_key
@@ -869,30 +976,20 @@ fn rewrite_gemini(raw: &str, s: &Settings, profile: &str) -> Result<String, Stri
         .filter(|k| !k.is_empty())
         .or_else(|| std::env::var("GEMINI_API_KEY").ok())
         .ok_or("chave do Gemini ausente (settings.json ou GEMINI_API_KEY)")?;
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        s.gemini_model, key
-    );
-    let body = serde_json::json!({
-        "contents": [{"parts": [{"text": format!("{}{}", build_prompt(s, profile), raw)}]}],
-        "generationConfig": {"temperature": 0.2}
-    });
-    let v: serde_json::Value = cloud_client()
-        .post(url)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("Gemini: {e}"))?
-        .json()
-        .map_err(|e| e.to_string())?;
-    let parts = &v["candidates"][0]["content"]["parts"];
-    let text = parts
-        .as_array()
-        .map(|a| a.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join(""))
-        .unwrap_or_default();
-    if text.trim().is_empty() {
-        return Err(format!("resposta vazia do Gemini: {v}"));
+    let prompt = format!("{}{}", build_prompt(s, profile), raw);
+    let escolhido = modelo_efetivo(&s.gemini_model);
+    match call_gemini(escolhido, &key, &prompt) {
+        Ok(t) => Ok(t),
+        // só o modelo indisponível justifica a segunda chamada: erro de rede
+        // erraria de novo e timeout de 30s viraria 60s de espera
+        Err((code, e)) if (code == 404 || code == 503) && escolhido != FALLBACK_MODEL => {
+            eprintln!("[gemini] {escolhido} indisponível ({e}); usando {FALLBACK_MODEL}");
+            let t = call_gemini(FALLBACK_MODEL, &key, &prompt).map_err(|(_, e2)| e2)?;
+            USE_FALLBACK.store(true, Ordering::Relaxed);
+            Ok(t)
+        }
+        Err((_, e)) => Err(e),
     }
-    Ok(text.trim().to_string())
 }
 
 fn apply_snippets(text: &str, snippets: &[Snippet]) -> String {
@@ -1766,6 +1863,54 @@ fn rebuild_tray_menu(app: &AppHandle, s: &Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// casos reais do history.jsonl: o Whisper assina o fim da transcrição
+    #[test]
+    fn assinatura_de_legenda_nao_chega_ao_texto_final() {
+        for (entrada, esperado) in [
+            (
+                "Mas isso será em um segundo momento. Legenda Adriana Zanotto",
+                "Mas isso será em um segundo momento.",
+            ),
+            (
+                "Fica bom para você? Legenda Adriana Zanotto",
+                "Fica bom para você?",
+            ),
+            (
+                "Tem texto. Legenda: Adriana Zanotto.",
+                "Tem texto.",
+            ),
+            (
+                "Foi ótimo. Legendas pela comunidade Amara.org",
+                "Foi ótimo.",
+            ),
+            // "legenda" dita pelo falante no meio da frase: preservar
+            (
+                "Quero as tabelas com título, legenda, nome das variáveis.",
+                "Quero as tabelas com título, legenda, nome das variáveis.",
+            ),
+            // frase final curta que só começa parecido: preservar
+            (
+                "Terminei o vídeo. Legendei tudo ontem.",
+                "Terminei o vídeo. Legendei tudo ontem.",
+            ),
+            ("Sem assinatura nenhuma aqui.", "Sem assinatura nenhuma aqui."),
+        ] {
+            assert_eq!(strip_credit(entrada), esperado, "entrada: {entrada:?}");
+        }
+        // sozinha, sem frase anterior, cai no guarda de alucinação
+        assert!(is_hallucination("Legenda Adriana Zanotto", 0.8));
+        assert!(!is_hallucination("Legenda Adriana Zanotto", 30.0));
+    }
+
+    #[test]
+    fn fallback_so_troca_o_modelo_depois_de_travado() {
+        USE_FALLBACK.store(false, Ordering::Relaxed);
+        assert_eq!(modelo_efetivo("gemini-3.5-flash-lite"), "gemini-3.5-flash-lite");
+        USE_FALLBACK.store(true, Ordering::Relaxed);
+        assert_eq!(modelo_efetivo("gemini-3.5-flash-lite"), FALLBACK_MODEL);
+        USE_FALLBACK.store(false, Ordering::Relaxed);
+    }
 
     /// `mode` deixou de ser um campo: agora o comportamento vem de qual atalho
     /// disparou. "hold" usa `hotkey`, "toggle" usa `hotkey_toggle`.
