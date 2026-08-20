@@ -541,7 +541,50 @@ fn is_hallucination(text: &str, audio_secs: f32) -> bool {
         || matches!(norm, "e aí" | "eaí" | "obrigado" | "obrigada" | "tchau" | "valeu" | "thank you")
 }
 
+/// O Whisper trabalha internamente a 16 kHz: qualquer coisa acima disso ele
+/// reamostra antes de processar. Enviar 48 kHz é subir 3x mais bytes para o
+/// servidor jogar dois terços fora — sem ganho nenhum de qualidade.
+///
+/// NÃO REMOVER EM MERGE COM O UPSTREAM. Sem isto, o teto de 25 MB da Groq cai
+/// de ~13,7 min para ~4,6 min de fala, e a transcrição falha em ditado longo.
+/// Já aconteceu no Mac; no Windows um ditado de 243 s chegou a 22,3 MB (89% do
+/// limite). Ver docs/alteracoes-do-fork.md.
+const STT_RATE: u32 = 16_000;
+
+/// Razão inteira (48000/16000 = 3) cai na média por blocos, que além de
+/// decimar funciona como filtro passa-baixa e evita aliasing. Razão quebrada
+/// cai na interpolação linear, que é suficiente para voz.
+fn resample(samples: &[f32], de: u32, para: u32) -> Vec<f32> {
+    if de == para || de == 0 || para == 0 || samples.is_empty() {
+        return samples.to_vec();
+    }
+    if de % para == 0 {
+        let fator = (de / para) as usize;
+        return samples
+            .chunks(fator)
+            .map(|c| c.iter().sum::<f32>() / c.len() as f32)
+            .collect();
+    }
+    let razao = para as f64 / de as f64;
+    let n = (samples.len() as f64 * razao).round() as usize;
+    (0..n)
+        .map(|i| {
+            let pos = i as f64 / razao;
+            let a = (pos.floor() as usize).min(samples.len() - 1);
+            let b = (a + 1).min(samples.len() - 1);
+            let f = (pos - a as f64) as f32;
+            samples[a] * (1.0 - f) + samples[b] * f
+        })
+        .collect()
+}
+
 fn wav_bytes(samples: &[f32], rate: u32) -> Vec<u8> {
+    let (samples, rate) = if rate > STT_RATE {
+        (resample(samples, rate, STT_RATE), STT_RATE)
+    } else {
+        (samples.to_vec(), rate)
+    };
+    let samples = &samples[..];
     let spec = hound::WavSpec {
         channels: 1,
         sample_rate: rate,
@@ -2117,6 +2160,47 @@ mod tests {
         let b = build_bindings(&s);
         assert_eq!(b.len(), 1);
         assert!(matches!(b[0].act, Act::Record { toggle: true, profile: None }));
+    }
+
+    /// Trava o comportamento contra merge com o upstream: se alguém remover a
+    /// reamostragem, estes testes falham em vez de o app voltar a estourar o
+    /// limite da Groq em silêncio.
+    #[test]
+    fn audio_e_reamostrado_para_16khz_antes_de_subir() {
+        // 1 segundo de silêncio a 48 kHz vira 1 segundo a 16 kHz
+        let wav = wav_bytes(&vec![0.0f32; 48_000], 48_000);
+        // cabeçalho WAV: taxa de amostragem nos bytes 24..28
+        let taxa = u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]);
+        assert_eq!(taxa, 16_000, "o WAV enviado precisa sair em 16 kHz");
+
+        // 48 kHz mono 16 bits = 96 KB/s; 16 kHz = 32 KB/s. Um terço do tamanho.
+        let dados = wav.len() - 44;
+        assert_eq!(dados, 32_000, "1s a 16 kHz e 16 bits deve dar 32.000 bytes");
+    }
+
+    #[test]
+    fn taxa_igual_ou_menor_que_16khz_passa_intacta() {
+        let wav = wav_bytes(&vec![0.0f32; 16_000], 16_000);
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 16_000);
+        let wav = wav_bytes(&vec![0.0f32; 8_000], 8_000);
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 8_000,
+            "taxa menor nao pode ser esticada");
+    }
+
+    #[test]
+    fn reamostragem_preserva_o_sinal() {
+        // razao inteira: media por blocos
+        let constante = vec![0.5f32; 4_800];
+        let r = resample(&constante, 48_000, 16_000);
+        assert_eq!(r.len(), 1_600);
+        assert!(r.iter().all(|v| (v - 0.5).abs() < 1e-6), "sinal constante deve sobreviver");
+
+        // razao quebrada: interpolacao linear
+        let r = resample(&vec![0.25f32; 4_410], 44_100, 16_000);
+        assert_eq!(r.len(), 1_600);
+        assert!(r.iter().all(|v| (v - 0.25).abs() < 1e-6));
+
+        assert_eq!(resample(&[1.0, 2.0], 16_000, 16_000), vec![1.0, 2.0], "mesma taxa nao mexe");
     }
 
     #[test]
