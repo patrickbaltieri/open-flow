@@ -136,6 +136,12 @@ existiria.
 responder 404. O app caía no texto bruto sem avisar, e a reescrita ficou dias
 desligada sem ninguém perceber.
 
+**Manter alinhado com o upstream.** A regra de quando travar a sessão é dele
+(`erro_e_definitivo`): só `404` rebaixa, porque significa que a chave não tem o
+modelo. `429` e `503` tentam o reserva mas **não** travam — são passageiros, e
+travar neles condenaria o resto da sessão por um pico. Quando ele mexer nessa
+regra, replicar aqui.
+
 ---
 
 ## 6. Cliente HTTP único
