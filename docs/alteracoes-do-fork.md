@@ -144,7 +144,31 @@ regra, replicar aqui.
 
 ---
 
-## 6. Cliente HTTP único
+## 6. Teto curto e retentativa também no caminho genérico
+
+**Onde:** `rewrite_client()` e `rewrite_openai()` / `rewrite_openai_uma_vez()`.
+
+Mesma razão do item 5: o teto de 4 s com segunda tentativa que o upstream pôs na
+v0.1.15 vive no `call_gemini`, e provedor da aba Provedores não passa por ali —
+ficava nos 30 s do `cloud_client`.
+
+**Por que dois clientes:** o `cloud_client` continua em 30 s porque a transcrição
+sobe o WAV e precisa do tempo. Reescrita é só texto.
+
+**Medição que justifica:** 10 chamadas ao Gemini com a mesma entrada deram
+`timeout(35s), 943, 1002, 19548, 643` e `746, 18298, 974, 642, 649` ms. Sete de
+dez abaixo de 1,1 s; o resto é travada isolada do free tier, não chamada
+legitimamente longa. Uma segunda tentativa pega outra fila.
+
+O erro de timeout carrega um marcador interno `__TIMEOUT__` que o wrapper troca
+por texto legível — se vazar, vira ruído no overlay.
+
+**Testes:** `marcador_de_timeout_nao_chega_ao_usuario`,
+`teto_da_reescrita_e_curto_o_bastante_para_retentativa`.
+
+---
+
+## 7. Cliente HTTP único
 
 **Onde:** `cloud_client()`.
 
@@ -157,7 +181,7 @@ free tier do Gemini. Se atrapalhar em outra rede, pode sair sem prejuízo.
 
 ---
 
-## 7. Balão de perfil e diagnóstico de colagem
+## 8. Balão de perfil e diagnóstico de colagem
 
 **Onde:** janela `toast` no `tauri.conf.json` (registrada em
 `capabilities/default.json` — janela fora dali tem os eventos negados em

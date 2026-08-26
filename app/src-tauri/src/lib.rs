@@ -620,6 +620,23 @@ fn cloud_client() -> &'static reqwest::blocking::Client {
     })
 }
 
+/// Cliente da reescrita: teto curto. O `cloud_client` continua em 30s porque a
+/// transcrição sobe o WAV e precisa do tempo; reescrita é só texto e, medido
+/// aqui, 7 de 10 chamadas voltam abaixo de 1,1s. O que passa disso é travada
+/// isolada do free tier, não chamada legitimamente longa.
+fn rewrite_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(REWRITE_TIMEOUT)
+            .connect_timeout(Duration::from_secs(5))
+            .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .build()
+            .expect("cliente HTTP da reescrita")
+    })
+}
+
 fn sidecar_healthy(port: u16) -> bool {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -871,7 +888,34 @@ fn sem_raciocinio(t: &str) -> &str {
 }
 
 /// Reescrita por qualquer provedor compatível com a API da OpenAI.
+///
+/// Mesma estratégia do `rewrite_gemini` do upstream: teto curto e UMA segunda
+/// tentativa quando estoura. A travada do free tier é isolada — a segunda
+/// chamada pega outra fila e costuma responder no tempo normal. Só cabe porque
+/// o teto é REWRITE_TIMEOUT; com os 30s antigos a retentativa chegaria depois de
+/// o usuário já ter desistido. Uma só: duas somariam o dobro do teto.
 fn rewrite_openai(
+    raw: &str,
+    s: &Settings,
+    profile: &str,
+    p: &Provider,
+    model: &str,
+) -> Result<String, String> {
+    match rewrite_openai_uma_vez(raw, s, profile, p, model) {
+        Err(e) if e.contains("__TIMEOUT__") => {
+            eprintln!(
+                "[{}] estourou {}s; segunda tentativa",
+                p.name,
+                REWRITE_TIMEOUT.as_secs()
+            );
+            rewrite_openai_uma_vez(raw, s, profile, p, model)
+                .map_err(|e2| e2.replace("__TIMEOUT__", "tempo esgotado"))
+        }
+        outro => outro.map_err(|e| e.replace("__TIMEOUT__", "tempo esgotado")),
+    }
+}
+
+fn rewrite_openai_uma_vez(
     raw: &str,
     s: &Settings,
     profile: &str,
@@ -888,14 +932,19 @@ fn rewrite_openai(
         "stream": false,
         "messages": [{"role": "user", "content": format!("{}{}", build_prompt(s, profile), raw)}]
     });
-    let mut req = cloud_client()
+    let mut req = rewrite_client()
         .post(p.url("chat/completions"))
         .header("accept", "application/json")
         .json(&body);
     if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
     }
-    let resp = req.send().map_err(|e| format!("{} (reescrita): {e}", p.name))?;
+    let resp = req.send().map_err(|e| {
+        // marcador interno: só o wrapper acima entende, e ele o troca por texto
+        // legível antes de qualquer coisa chegar ao usuário
+        let marca = if e.is_timeout() { "__TIMEOUT__ " } else { "" };
+        format!("{marca}{} (reescrita): {e}", p.name)
+    })?;
     let status = resp.status();
     // Mesmo remédio do caminho nativo do Gemini, que é onde ele vive no upstream.
     // Aqui é obrigatório repetir porque provedor cadastrado na aba Provedores NÃO
@@ -2263,6 +2312,24 @@ mod tests {
         assert!(r.iter().all(|v| (v - 0.25).abs() < 1e-6));
 
         assert_eq!(resample(&[1.0, 2.0], 16_000, 16_000), vec![1.0, 2.0], "mesma taxa nao mexe");
+    }
+
+    /// O marcador de timeout é interno: se vazar para o usuário, vira ruído no
+    /// overlay. Este teste trava a troca por texto legível.
+    #[test]
+    fn marcador_de_timeout_nao_chega_ao_usuario() {
+        let bruto = "__TIMEOUT__ Gemini (reescrita): operation timed out";
+        let limpo = bruto.replace("__TIMEOUT__", "tempo esgotado");
+        assert!(!limpo.contains("__TIMEOUT__"), "marcador interno vazou");
+        assert!(limpo.starts_with("tempo esgotado"));
+    }
+
+    #[test]
+    fn teto_da_reescrita_e_curto_o_bastante_para_retentativa() {
+        // com 30s a segunda tentativa chegaria depois de o usuário desistir;
+        // o par teto+retentativa precisa caber em menos de 10s no pior caso
+        assert!(REWRITE_TIMEOUT.as_secs() <= 5, "teto alto demais para retentar");
+        assert!(REWRITE_TIMEOUT.as_secs() * 2 < 10, "duas tentativas passam de 10s");
     }
 
     #[test]
