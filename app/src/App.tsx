@@ -26,6 +26,7 @@ export interface Provider {
   name: string;
   base_url: string;
   api_key: string | null;
+  timeout_secs: number;
 }
 
 interface ProviderTest {
@@ -707,7 +708,7 @@ function ProvidersTab({ s, patch }: TabProps) {
     for (let n = 2; s.providers.some((p) => p.name === nome); n++) {
       nome = `${base.name} ${n}`;
     }
-    patch({ providers: [...s.providers, { name: nome, base_url: base.base_url, api_key: null }] });
+    patch({ providers: [...s.providers, { name: nome, base_url: base.base_url, api_key: null, timeout_secs: 0 }] });
   };
 
   return (
@@ -765,6 +766,27 @@ function ProvidersTab({ s, patch }: TabProps) {
                 value={p.api_key ?? ""}
                 onChange={(v) => update(i, { api_key: v || null })}
               />
+            </label>
+
+            <label className="field">
+              <span>Tempo limite da reescrita</span>
+              <div className="modelo-linha">
+                <input
+                  type="number"
+                  min={0}
+                  max={60}
+                  value={p.timeout_secs || ""}
+                  placeholder="4 (padrão)"
+                  onChange={(e) => update(i, { timeout_secs: Number(e.target.value) || 0 })}
+                />
+                <span className="unidade">segundos</span>
+              </div>
+              <small>
+                Vazio usa o padrão de 4s, que serve para Groq e Gemini. Gateway agregador
+                costuma precisar de mais: se o ditado sair sem correção e o tempo bater o
+                dobro deste valor, foi timeout — a chamada é repetida uma vez antes de
+                desistir.
+              </small>
             </label>
 
             {st?.r && (

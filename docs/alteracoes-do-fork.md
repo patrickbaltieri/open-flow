@@ -168,7 +168,31 @@ por texto legível — se vazar, vira ruído no overlay.
 
 ---
 
-## 7. Cliente HTTP único
+## 7. Teto por provedor e aviso de reescrita que falhou
+
+**Onde:** `Provider.timeout_secs` / `Provider::timeout()`, campo na aba Provedores,
+e o `aviso` no `spawn_pipeline`.
+
+**Teto por provedor:** a latência é característica de quem responde, não do app.
+Medido: Groq e Gemini abaixo de 1,1 s; `codex/gpt-5.6-terra-medium` pelo OmniRoute
+leva 4,6 a 5,6 s. Um teto único condenaria um dos dois — com 4 s o terra estourava,
+retentava e estourava de novo, gravando 8,00 s cravados no histórico e colando
+texto bruto. `0` (ou ausente) usa o padrão; o teto vai por requisição, não no
+cliente.
+
+**Aviso de falha:** reescrita que falha não aborta o ditado — o texto bruto do
+Whisper ainda serve. Mas falhar em silêncio já custou dias **duas vezes**: modelo
+descontinuado (`gemini-2.5-flash`, 404) e modelo que sumiu da conta
+(`llama-3.3-70b-versatile`, 404). Nos dois casos o único sintoma era "o texto saiu
+sem correção". Agora o motivo aparece no balão depois da colagem, passando pelo
+`friendly_error` do upstream.
+
+**Testes:** `teto_por_provedor_sobrepoe_o_padrao`,
+`teto_de_doze_segundos_cobre_o_gateway_lento`.
+
+---
+
+## 8. Cliente HTTP único
 
 **Onde:** `cloud_client()`.
 
@@ -181,7 +205,7 @@ free tier do Gemini. Se atrapalhar em outra rede, pode sair sem prejuízo.
 
 ---
 
-## 8. Balão de perfil e diagnóstico de colagem
+## 9. Balão de perfil e diagnóstico de colagem
 
 **Onde:** janela `toast` no `tauri.conf.json` (registrada em
 `capabilities/default.json` — janela fora dali tem os eventos negados em

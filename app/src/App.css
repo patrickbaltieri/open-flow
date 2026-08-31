@@ -345,6 +345,13 @@ button.link:hover {
   white-space: nowrap;
 }
 
+.modelo-linha .unidade {
+  align-self: center;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+}
+
 .hotkey-input {
   position: relative;
 }

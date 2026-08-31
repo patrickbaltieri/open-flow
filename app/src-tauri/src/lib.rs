@@ -51,12 +51,26 @@ struct Provider {
     /// endereço base, ex.: https://api.groq.com/openai/v1
     base_url: String,
     api_key: Option<String>,
+    /// teto por chamada de reescrita, em segundos. 0 ou ausente = REWRITE_TIMEOUT.
+    /// Existe porque a latência é característica do provedor, não do app: Groq e
+    /// Gemini respondem abaixo de 1,1s, enquanto um gateway agregador pode levar
+    /// 5s no caminho normal. Teto único condenaria um dos dois.
+    timeout_secs: u32,
 }
 
 impl Provider {
     /// junta o caminho ao endereço base tolerando barra sobrando ou faltando
     fn url(&self, caminho: &str) -> String {
         format!("{}/{}", self.base_url.trim_end_matches('/'), caminho.trim_start_matches('/'))
+    }
+
+    /// teto desta chamada; sem valor próprio, usa o padrão
+    fn timeout(&self) -> Duration {
+        if self.timeout_secs == 0 {
+            REWRITE_TIMEOUT
+        } else {
+            Duration::from_secs(self.timeout_secs as u64)
+        }
     }
 }
 
@@ -260,6 +274,7 @@ fn migrate_providers(s: &mut Settings) {
                 name: "Groq".into(),
                 base_url: "https://api.groq.com/openai/v1".into(),
                 api_key: s.groq_api_key.clone(),
+                timeout_secs: 0,
             });
         }
         if s.gemini_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false) {
@@ -269,6 +284,7 @@ fn migrate_providers(s: &mut Settings) {
                 name: "Gemini".into(),
                 base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
                 api_key: s.gemini_api_key.clone(),
+                timeout_secs: 0,
             });
         }
     }
@@ -628,7 +644,8 @@ fn rewrite_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
-            .timeout(REWRITE_TIMEOUT)
+            // sem teto no cliente: cada chamada define o seu, porque ele varia
+            // por provedor (ver Provider::timeout)
             .connect_timeout(Duration::from_secs(5))
             .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             .pool_idle_timeout(Duration::from_secs(90))
@@ -903,11 +920,7 @@ fn rewrite_openai(
 ) -> Result<String, String> {
     match rewrite_openai_uma_vez(raw, s, profile, p, model) {
         Err(e) if e.contains("__TIMEOUT__") => {
-            eprintln!(
-                "[{}] estourou {}s; segunda tentativa",
-                p.name,
-                REWRITE_TIMEOUT.as_secs()
-            );
+            eprintln!("[{}] estourou {}s; segunda tentativa", p.name, p.timeout().as_secs());
             rewrite_openai_uma_vez(raw, s, profile, p, model)
                 .map_err(|e2| e2.replace("__TIMEOUT__", "tempo esgotado"))
         }
@@ -934,6 +947,7 @@ fn rewrite_openai_uma_vez(
     });
     let mut req = rewrite_client()
         .post(p.url("chat/completions"))
+        .timeout(p.timeout())
         .header("accept", "application/json")
         .json(&body);
     if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -1452,10 +1466,17 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                                     return Err(format!("alucinação de silêncio descartada: {raw:?}"));
                                 }
                                 let t_stt = t0.elapsed().as_secs_f32();
+                                // Reescrita que falha NÃO aborta o ditado: o texto bruto do
+                                // Whisper ainda é útil. Mas falhar em silêncio já custou dias
+                                // duas vezes — modelo descontinuado e modelo inexistente na
+                                // conta — porque o único sintoma era "o texto saiu sem
+                                // correção". O motivo vai para o balão depois da colagem.
+                                let mut aviso: Option<String> = None;
                                 let final_text = match rewrite(&raw, &s, &profile) {
                                     Ok(t) => t,
                                     Err(e) => {
                                         eprintln!("[pipeline] reescrita falhou ({e}); usando texto bruto");
+                                        aviso = Some(friendly_error(&e));
                                         raw.clone()
                                     }
                                 };
@@ -1475,10 +1496,15 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                                 }
                                 *shared_w.last_text.lock().unwrap() = final_text.clone();
                                 let _serial = shared_w.insert_lock.lock().unwrap();
-                                insert_text(&final_text)
+                                insert_text(&final_text).map(|()| aviso)
                             });
                         match result {
-                            Ok(()) => overlay_hide(&app_w, gen_w),
+                            // colou, mas sem reescrita: o texto é o bruto do Whisper
+                            Ok(Some(motivo)) => {
+                                overlay_hide(&app_w, gen_w);
+                                toast_show(&app_w, &format!("texto sem correção — {motivo}"));
+                            }
+                            Ok(None) => overlay_hide(&app_w, gen_w),
                             Err(e) => {
                                 eprintln!("[pipeline] erro: {e}");
                                 overlay_fail(&app_w, gen_w, &e);
@@ -1700,7 +1726,7 @@ fn probe_audio(p: &Provider) -> bool {
 /// abrir a aba não gasta chamada de API.
 #[tauri::command]
 fn test_provider(base_url: String, api_key: Option<String>) -> ProviderTest {
-    let p = Provider { name: String::new(), base_url, api_key };
+    let p = Provider { name: String::new(), base_url, api_key, timeout_secs: 0 };
     if p.base_url.trim().is_empty() {
         return ProviderTest {
             ok: false,
@@ -2332,10 +2358,34 @@ mod tests {
         assert!(REWRITE_TIMEOUT.as_secs() * 2 < 10, "duas tentativas passam de 10s");
     }
 
+    /// Provedor lento não pode ser condenado pelo teto calibrado no provedor
+    /// rápido: a latência é característica de quem responde, não do app.
+    #[test]
+    fn teto_por_provedor_sobrepoe_o_padrao() {
+        let padrao = Provider { name: "Groq".into(), base_url: "https://x/v1".into(),
+                                api_key: None, timeout_secs: 0 };
+        assert_eq!(padrao.timeout(), REWRITE_TIMEOUT, "0 significa usar o padrão");
+
+        let lento = Provider { name: "OmniRoute".into(), base_url: "https://y/v1".into(),
+                               api_key: None, timeout_secs: 12 };
+        assert_eq!(lento.timeout(), Duration::from_secs(12));
+        assert!(lento.timeout() > padrao.timeout());
+    }
+
+    /// Medido: gpt-5.6-terra-medium leva 4,6-5,6s pelo OmniRoute. Com o teto de
+    /// 4s ele estourava, retentava e estourava de novo — 8,00s cravados no
+    /// histórico e texto bruto colado sem aviso.
+    #[test]
+    fn teto_de_doze_segundos_cobre_o_gateway_lento() {
+        let p = Provider { name: "OmniRoute".into(), base_url: "https://y/v1".into(),
+                           api_key: None, timeout_secs: 12 };
+        assert!(p.timeout().as_millis() > 5_600, "precisa caber a pior medição do gateway");
+    }
+
     #[test]
     fn url_do_provedor_tolera_barra_sobrando_ou_faltando() {
-        let com = Provider { name: "x".into(), base_url: "https://a.b/v1/".into(), api_key: None };
-        let sem = Provider { name: "x".into(), base_url: "https://a.b/v1".into(), api_key: None };
+        let com = Provider { name: "x".into(), base_url: "https://a.b/v1/".into(), api_key: None, timeout_secs: 0 };
+        let sem = Provider { name: "x".into(), base_url: "https://a.b/v1".into(), api_key: None, timeout_secs: 0 };
         assert_eq!(com.url("chat/completions"), "https://a.b/v1/chat/completions");
         assert_eq!(sem.url("/chat/completions"), "https://a.b/v1/chat/completions");
         assert_eq!(sem.url("models"), "https://a.b/v1/models");
@@ -2388,7 +2438,7 @@ mod tests {
         s.providers = vec![Provider {
             name: "Meu gateway".into(),
             base_url: "https://omniroute.exemplo/v1".into(),
-            api_key: Some("sk-1".into()),
+            api_key: Some("sk-1".into()), timeout_secs: 0,
         }];
         s.rewrite_provider_name = "Meu gateway".into();
         s.rewrite_model = "algum/modelo".into();
