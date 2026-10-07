@@ -654,3 +654,8 @@ details summary {
   padding: 0.25rem 0;
   color: var(--muted);
 }
+
+.conta-chatgpt {
+  align-self: center;
+  flex: 1;
+}

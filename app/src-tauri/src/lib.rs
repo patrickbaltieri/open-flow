@@ -13,6 +13,7 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 
 mod platform;
+mod siwc;
 
 const RULES: &str = "Você é um editor de ditado. Receberá a transcrição literal de uma fala em pt-BR.\n\
 Invioláveis: NÃO adicione fatos, NÃO resuma, NÃO omita conteúdo.\n\
@@ -54,6 +55,22 @@ struct Snippet {
     text: String,
 }
 
+/// Como o provedor se autentica, e por tabela em que rota ele atende.
+///
+/// `ChatgptOauth` não é "mais um compatível com a OpenAI": fala a Responses API
+/// com forma própria, se autentica por token que expira de hora em hora, e
+/// **não transcreve** — a documentação do fluxo recusa áudio e o endpoint de
+/// transcrição. Por isso é tipo, não um `base_url` diferente.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum ProviderKind {
+    /// Groq, OpenRouter, OmniRoute, Gemini — chave estática no cabeçalho
+    #[default]
+    ApiKey,
+    /// Sign in with ChatGPT, gastando a cota do plano do usuário
+    ChatgptOauth,
+}
+
 /// Provedor de LLM que fala o dialeto OpenAI (`/models`, `/chat/completions`).
 /// Cobre Groq, OpenRouter, OmniRoute e o próprio Gemini pelo endpoint de
 /// compatibilidade — cada um verificado antes de generalizar.
@@ -70,6 +87,9 @@ struct Provider {
     /// Gemini respondem abaixo de 1,1s, enquanto um gateway agregador pode levar
     /// 5s no caminho normal. Teto único condenaria um dos dois.
     timeout_secs: u32,
+    /// como autentica; ausente no arquivo antigo vira `ApiKey`, o comportamento
+    /// que já existia
+    kind: ProviderKind,
 }
 
 impl Provider {
@@ -246,7 +266,7 @@ impl Settings {
     }
 }
 
-fn config_dir() -> std::path::PathBuf {
+pub(crate) fn config_dir() -> std::path::PathBuf {
     dirs::config_dir().unwrap().join("OpenFlow")
 }
 
@@ -258,7 +278,7 @@ fn settings_path() -> std::path::PathBuf {
 const ENC_PREFIX: &str = "enc:";
 
 /// `name` identifica o item no cofre da plataforma (o Keychain precisa; o DPAPI ignora)
-fn decrypt_key(name: &str, v: &Option<String>) -> Option<String> {
+pub(crate) fn decrypt_key(name: &str, v: &Option<String>) -> Option<String> {
     v.as_ref()
         .map(|s| match s.strip_prefix(ENC_PREFIX) {
             Some(stored) => platform::unprotect_secret(name, stored).unwrap_or_default(),
@@ -267,7 +287,7 @@ fn decrypt_key(name: &str, v: &Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn encrypt_key(name: &str, v: &Option<String>) -> Option<String> {
+pub(crate) fn encrypt_key(name: &str, v: &Option<String>) -> Option<String> {
     v.as_ref().filter(|s| !s.is_empty()).map(|s| {
         if s.starts_with(ENC_PREFIX) {
             s.clone()
@@ -290,6 +310,7 @@ fn migrate_providers(s: &mut Settings) {
                 base_url: "https://api.groq.com/openai/v1".into(),
                 api_key: s.groq_api_key.clone(),
                 timeout_secs: 0,
+                kind: ProviderKind::ApiKey,
             });
         }
         if s.gemini_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false) {
@@ -300,6 +321,7 @@ fn migrate_providers(s: &mut Settings) {
                 base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
                 api_key: s.gemini_api_key.clone(),
                 timeout_secs: 0,
+                kind: ProviderKind::ApiKey,
             });
         }
     }
@@ -638,7 +660,7 @@ fn wav_bytes(samples: &[f32], rate: u32) -> Vec<u8> {
 /// em rede com IPv6 anunciado mas sem rota (VPN que bloqueia IPv6, por exemplo)
 /// a conexão fica pendurada até o timeout de 30s. Amarrar a saída em IPv4 e
 /// reaproveitar a conexão elimina os dois problemas.
-fn cloud_client() -> &'static reqwest::blocking::Client {
+pub(crate) fn cloud_client() -> &'static reqwest::blocking::Client {
     static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::blocking::Client::builder()
@@ -715,6 +737,15 @@ fn transcribe_openai(
     model: &str,
     lang: &str,
 ) -> Result<String, String> {
+    if p.kind == ProviderKind::ChatgptOauth {
+        // Não é limitação do app: o fluxo de uso do plano recusa áudio e o
+        // endpoint de transcrição. Dizer isso é melhor que mandar o WAV e
+        // receber um 400 sem explicação.
+        return Err(format!(
+            "'{}' é conexão com o ChatGPT, que não transcreve — escolha um provedor de chave",
+            p.name
+        ));
+    }
     if model.trim().is_empty() {
         return Err(format!("nenhum modelo de transcrição escolhido para '{}'", p.name));
     }
@@ -924,15 +955,46 @@ fn alvo_do_perfil<'a>(
     }
 }
 
+/// Separa o esforço de raciocínio do nome do modelo: `gpt-5.6-luna:low`.
+///
+/// Vai no próprio nome em vez de virar campo novo porque atravessa tudo que já
+/// existe — seletor de modelo, escolha por perfil, histórico — sem migração. É
+/// a mesma convenção que o gateway usava em `codex/gpt-5.6-terra-medium`.
+fn modelo_e_esforco(modelo: &str) -> (&str, &str) {
+    match modelo.split_once(':') {
+        Some((m, e)) => (m, e),
+        None => (modelo, ""),
+    }
+}
+
+/// Despacha para a rota que o provedor atende. Só o `ChatgptOauth` sai do
+/// dialeto comum.
+fn rewrite_no_provedor(
+    raw: &str,
+    s: &Settings,
+    profile: &str,
+    p: &Provider,
+    modelo: &str,
+) -> Result<String, String> {
+    if p.kind != ProviderKind::ChatgptOauth {
+        return rewrite_openai(raw, s, profile, p, modelo);
+    }
+    let (m, esforco) = modelo_e_esforco(modelo);
+    // A Responses API recusa item `{role:"system"}`: a instrução vai em
+    // `instructions` e só a transcrição vai em `input`.
+    siwc::responder(m, &build_prompt(s, profile), raw, esforco, p.timeout())
+        .map(|t| sem_raciocinio(&t).trim().to_string())
+}
+
 fn rewrite(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
     // Escolha do perfil ganha da global: é a mais específica, pela mesma lógica
     // que ordena os atalhos do mais específico para o mais genérico.
     if let Some((p, modelo)) = alvo_do_perfil(s, profile)? {
-        return rewrite_openai(raw, s, profile, p, modelo);
+        return rewrite_no_provedor(raw, s, profile, p, modelo);
     }
     if !s.rewrite_provider_name.is_empty() {
         match s.providers.iter().find(|p| p.name == s.rewrite_provider_name) {
-            Some(p) => return rewrite_openai(raw, s, profile, p, &s.rewrite_model),
+            Some(p) => return rewrite_no_provedor(raw, s, profile, p, &s.rewrite_model),
             // provedor removido sem trocar a seleção: avisa em vez de falhar calado
             None => {
                 return Err(format!(
@@ -1776,9 +1838,51 @@ fn probe_audio(p: &Provider) -> bool {
 
 /// Testa a conexão e lista os modelos. Só roda quando o usuário clica —
 /// abrir a aba não gasta chamada de API.
+/// Abre o navegador e espera a autorização. Bloqueia até cinco minutos — o
+/// Tauri roda comandos fora da thread da interface, então a janela continua viva.
+#[tauri::command]
+fn siwc_conectar(app: AppHandle) -> Result<siwc::Conta, String> {
+    siwc::conectar(|url| {
+        use tauri_plugin_opener::OpenerExt;
+        if let Err(e) = app.opener().open_url(url, None::<&str>) {
+            eprintln!("[siwc] não consegui abrir o navegador: {e}");
+        }
+    })
+}
+
+#[tauri::command]
+fn siwc_conta() -> Option<siwc::Conta> {
+    siwc::conta()
+}
+
+#[tauri::command]
+fn siwc_desconectar() -> Result<(), String> {
+    siwc::desconectar()
+}
+
+/// Catálogo da assinatura, já com as variantes de esforço que o app aceita no
+/// nome do modelo.
+#[tauri::command]
+fn siwc_modelos() -> Result<Vec<String>, String> {
+    let base = siwc::modelos()?;
+    let mut fora = Vec::with_capacity(base.len() * 3);
+    for m in base {
+        for e in ["low", "medium", "high"] {
+            fora.push(format!("{m}:{e}"));
+        }
+    }
+    Ok(fora)
+}
+
 #[tauri::command]
 fn test_provider(base_url: String, api_key: Option<String>) -> ProviderTest {
-    let p = Provider { name: String::new(), base_url, api_key, timeout_secs: 0 };
+    let p = Provider {
+        name: String::new(),
+        base_url,
+        api_key,
+        timeout_secs: 0,
+        kind: ProviderKind::ApiKey,
+    };
     if p.base_url.trim().is_empty() {
         return ProviderTest {
             ok: false,
@@ -2415,11 +2519,11 @@ mod tests {
     #[test]
     fn teto_por_provedor_sobrepoe_o_padrao() {
         let padrao = Provider { name: "Groq".into(), base_url: "https://x/v1".into(),
-                                api_key: None, timeout_secs: 0 };
+                                api_key: None, timeout_secs: 0, ..Default::default() };
         assert_eq!(padrao.timeout(), REWRITE_TIMEOUT, "0 significa usar o padrão");
 
         let lento = Provider { name: "OmniRoute".into(), base_url: "https://y/v1".into(),
-                               api_key: None, timeout_secs: 12 };
+                               api_key: None, timeout_secs: 12, ..Default::default() };
         assert_eq!(lento.timeout(), Duration::from_secs(12));
         assert!(lento.timeout() > padrao.timeout());
     }
@@ -2430,9 +2534,9 @@ mod tests {
         let mut s = Settings::default();
         s.providers = vec![
             Provider { name: "Groq".into(), base_url: "https://groq/v1".into(),
-                       api_key: None, timeout_secs: 0 },
+                       api_key: None, timeout_secs: 0, ..Default::default() },
             Provider { name: "Omniroute".into(), base_url: "https://omni/v1".into(),
-                       api_key: None, timeout_secs: 12 },
+                       api_key: None, timeout_secs: 12, ..Default::default() },
         ];
         s.rewrite_provider_name = "Groq".into();
         s.rewrite_model = "openai/gpt-oss-120b".into();
@@ -2500,20 +2604,61 @@ mod tests {
         assert!(e.contains("modelo"), "modelo vazio tem de ser dito, não virar 404: {e}");
     }
 
+    /// O esforço viaja no nome do modelo para atravessar seletor, perfil e
+    /// histórico sem campo novo. Modelo sem `:` continua valendo como sempre.
+    #[test]
+    fn esforco_viaja_no_nome_do_modelo() {
+        assert_eq!(modelo_e_esforco("gpt-5.6-luna:low"), ("gpt-5.6-luna", "low"));
+        assert_eq!(modelo_e_esforco("gpt-5.6-terra:medium"), ("gpt-5.6-terra", "medium"));
+        assert_eq!(
+            modelo_e_esforco("openai/gpt-oss-120b"),
+            ("openai/gpt-oss-120b", ""),
+            "modelo de provedor de chave não pode ganhar esforço do nada"
+        );
+    }
+
+    /// O fluxo de uso do plano recusa áudio e o endpoint de transcrição. Mandar
+    /// o WAV mesmo assim devolveria um 400 sem explicação.
+    #[test]
+    fn chatgpt_recusa_transcricao_com_motivo() {
+        let p = Provider {
+            name: "ChatGPT".into(),
+            base_url: siwc::RESOURCE.into(),
+            api_key: None,
+            timeout_secs: 60,
+            kind: ProviderKind::ChatgptOauth,
+        };
+        let e = transcribe_openai(vec![0u8; 64], &p, "gpt-5.6-luna", "pt").unwrap_err();
+        assert!(e.contains("não transcreve"), "precisa dizer o motivo: {e}");
+        assert!(e.contains("ChatGPT"), "precisa nomear o provedor: {e}");
+    }
+
+    /// Configuração anterior não tem o campo; virar `ChatgptOauth` por engano
+    /// mandaria todo provedor de chave para a rota errada.
+    #[test]
+    fn provedor_sem_tipo_continua_sendo_de_chave() {
+        let p: Provider = serde_json::from_str(
+            r#"{"name":"Groq","base_url":"https://api.groq.com/openai/v1"}"#,
+        )
+        .expect("arquivo antigo tem de continuar lendo");
+        assert_eq!(p.kind, ProviderKind::ApiKey);
+        assert_eq!(p.timeout_secs, 0);
+    }
+
     /// Medido: gpt-5.6-terra-medium leva 4,6-5,6s pelo OmniRoute. Com o teto de
     /// 4s ele estourava, retentava e estourava de novo — 8,00s cravados no
     /// histórico e texto bruto colado sem aviso.
     #[test]
     fn teto_de_doze_segundos_cobre_o_gateway_lento() {
         let p = Provider { name: "OmniRoute".into(), base_url: "https://y/v1".into(),
-                           api_key: None, timeout_secs: 12 };
+                           api_key: None, timeout_secs: 12, ..Default::default() };
         assert!(p.timeout().as_millis() > 5_600, "precisa caber a pior medição do gateway");
     }
 
     #[test]
     fn url_do_provedor_tolera_barra_sobrando_ou_faltando() {
-        let com = Provider { name: "x".into(), base_url: "https://a.b/v1/".into(), api_key: None, timeout_secs: 0 };
-        let sem = Provider { name: "x".into(), base_url: "https://a.b/v1".into(), api_key: None, timeout_secs: 0 };
+        let com = Provider { name: "x".into(), base_url: "https://a.b/v1/".into(), api_key: None, timeout_secs: 0, ..Default::default() };
+        let sem = Provider { name: "x".into(), base_url: "https://a.b/v1".into(), api_key: None, timeout_secs: 0, ..Default::default() };
         assert_eq!(com.url("chat/completions"), "https://a.b/v1/chat/completions");
         assert_eq!(sem.url("/chat/completions"), "https://a.b/v1/chat/completions");
         assert_eq!(sem.url("models"), "https://a.b/v1/models");
@@ -2566,7 +2711,7 @@ mod tests {
         s.providers = vec![Provider {
             name: "Meu gateway".into(),
             base_url: "https://omniroute.exemplo/v1".into(),
-            api_key: Some("sk-1".into()), timeout_secs: 0,
+            api_key: Some("sk-1".into()), timeout_secs: 0, ..Default::default()
         }];
         s.rewrite_provider_name = "Meu gateway".into();
         s.rewrite_model = "algum/modelo".into();
@@ -2697,7 +2842,11 @@ pub fn run() {
             get_diagnostics,
             get_autostart,
             set_autostart,
-            test_provider
+            test_provider,
+            siwc_conectar,
+            siwc_conta,
+            siwc_desconectar,
+            siwc_modelos
         ])
         .setup(move |app| {
             // app de bandeja: no mac o ícone vive só na menu bar, sem Dock

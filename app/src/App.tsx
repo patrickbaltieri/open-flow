@@ -30,7 +30,25 @@ export interface Provider {
   base_url: string;
   api_key: string | null;
   timeout_secs: number;
+  /// ausente = provedor de chave, como sempre foi
+  kind?: "api_key" | "chatgpt_oauth";
 }
+
+/// Conta do ChatGPT conectada. Tokens ficam só no backend — aqui chega o
+/// mínimo para a interface dizer quem está conectado.
+interface ContaChatgpt {
+  email: string;
+  usa_o_plano: boolean;
+  scopes: string[];
+}
+
+const ehChatgpt = (p?: Provider) => p?.kind === "chatgpt_oauth";
+
+/// Padrão da assinatura, medido em 07/10 no ditado clínico real: `luna:low`
+/// acertou as 7 checagens de fidelidade em 18,3s, contra 27,2s do
+/// `terra:medium` para o mesmo acerto. Esforço alto passou de 60s e piorou —
+/// edição fiel não melhora com mais raciocínio.
+const PADRAO_CHATGPT = "gpt-5.6-luna:low";
 
 interface ProviderTest {
   ok: boolean;
@@ -475,7 +493,7 @@ function GeneralTab({ s, patch }: TabProps) {
         rotulo="Provedor da transcrição"
         provedor={s.stt_provider_name}
         modelo={s.stt_model}
-        aoTrocarProvedor={(v) => patch({ stt_provider_name: v, stt_model: "" })}
+        aoTrocarProvedor={(v, m) => patch({ stt_provider_name: v, stt_model: m })}
         aoTrocarModelo={(v) => patch({ stt_model: v })}
         opcaoVazia="— Local (GPU, sem nuvem) —"
         somenteTranscricao
@@ -533,7 +551,7 @@ function GeneralTab({ s, patch }: TabProps) {
         rotulo="Provedor da reescrita"
         provedor={s.rewrite_provider_name}
         modelo={s.rewrite_model}
-        aoTrocarProvedor={(v) => patch({ rewrite_provider_name: v, rewrite_model: "" })}
+        aoTrocarProvedor={(v, m) => patch({ rewrite_provider_name: v, rewrite_model: m })}
         aoTrocarModelo={(v) => patch({ rewrite_model: v })}
         opcaoVazia="— nenhum (cola o texto bruto, sem reescrever) —"
       />
@@ -560,7 +578,9 @@ function ModelPicker({
   rotulo: string;
   provedor: string;
   modelo: string;
-  aoTrocarProvedor: (v: string) => void;
+  /// provedor e modelo juntos de propósito: dois `patch` seguidos correm o
+  /// risco de um sobrescrever o outro antes do React reconciliar
+  aoTrocarProvedor: (v: string, modeloSugerido: string) => void;
   aoTrocarModelo: (v: string) => void;
   opcaoVazia: string;
   /// mostra só os modelos que o provedor declara como transcrição
@@ -581,12 +601,40 @@ function ModelPicker({
   const carregar = async () => {
     if (!atual) return;
     setCarregando(true);
-    setResultado(
-      await invoke<ProviderTest>("test_provider", {
-        baseUrl: atual.base_url,
-        apiKey: atual.api_key,
-      })
-    );
+    if (ehChatgpt(atual)) {
+      // catálogo da assinatura: envelope próprio e sem chave, por isso não
+      // passa pelo test_provider
+      try {
+        const modelos = await invoke<string[]>("siwc_modelos");
+        setResultado({
+          ok: true,
+          models: modelos,
+          message: `${modelos.length} opções da sua assinatura`,
+          no_catalog: false,
+          // a assinatura não transcreve: o fluxo recusa áudio
+          audio: false,
+          transcription_models: [],
+          transcription_source: "",
+        });
+      } catch (e) {
+        setResultado({
+          ok: false,
+          models: [],
+          message: String(e),
+          no_catalog: false,
+          audio: false,
+          transcription_models: [],
+          transcription_source: "",
+        });
+      }
+    } else {
+      setResultado(
+        await invoke<ProviderTest>("test_provider", {
+          baseUrl: atual.base_url,
+          apiKey: atual.api_key,
+        })
+      );
+    }
     setCarregando(false);
   };
 
@@ -612,13 +660,24 @@ function ModelPicker({
     <>
       <label className="field">
         <span>{rotulo}</span>
-        <select value={provedor} onChange={(e) => aoTrocarProvedor(e.target.value)}>
+        <select
+          value={provedor}
+          onChange={(e) => {
+            const novo = e.target.value;
+            const alvo = s.providers.find((x) => x.name === novo);
+            aoTrocarProvedor(novo, ehChatgpt(alvo) ? PADRAO_CHATGPT : "");
+          }}
+        >
           <option value="">{opcaoVazia}</option>
-          {s.providers.map((p) => (
-            <option key={p.name} value={p.name}>
-              {p.name}
-            </option>
-          ))}
+          {s.providers
+            // conexão com o ChatGPT não aparece na transcrição: o fluxo de uso
+            // do plano recusa áudio, então oferecê-la só levaria a um erro
+            .filter((p) => !(somenteTranscricao && ehChatgpt(p)))
+            .map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name}
+              </option>
+            ))}
         </select>
         <small>{ajuda ?? "Cadastre e remova provedores na aba Provedores."}</small>
       </label>
@@ -676,6 +735,72 @@ const PRESETS: { name: string; base_url: string; nota: string }[] = [
   { name: "OmniRoute", base_url: "https://omniroute.ihub.click/v1", nota: "seu gateway" },
 ];
 
+/// Conectar, mostrar quem está conectado e desconectar. Os tokens nunca passam
+/// por aqui: o backend guarda protegido e devolve só o e-mail e os escopos.
+function ContaChatgptCard() {
+  const [conta, setConta] = useState<ContaChatgpt | null>(null);
+  const [ocupado, setOcupado] = useState(false);
+  const [erro, setErro] = useState("");
+
+  useEffect(() => {
+    invoke<ContaChatgpt | null>("siwc_conta").then(setConta).catch(() => {});
+  }, []);
+
+  const conectar = async () => {
+    setOcupado(true);
+    setErro("");
+    try {
+      setConta(await invoke<ContaChatgpt>("siwc_conectar"));
+    } catch (e) {
+      setErro(String(e));
+    }
+    setOcupado(false);
+  };
+
+  const sair = async () => {
+    await invoke("siwc_desconectar");
+    setConta(null);
+  };
+
+  if (!conta) {
+    return (
+      <div className="field">
+        <button onClick={conectar} disabled={ocupado}>
+          {ocupado ? "aguardando a autorização no navegador..." : "Continue with ChatGPT"}
+        </button>
+        <small>
+          Abre o navegador para você autorizar. A reescrita passa a sair da cota do seu plano
+          ChatGPT, sem chave de API. <b>Não serve para transcrição</b> — esse fluxo não aceita
+          áudio.
+        </small>
+        {erro && <p className="prov-erro">✗ {erro}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="field">
+      <div className="modelo-linha">
+        <span className="conta-chatgpt">
+          Conectado como <b>{conta.email}</b>
+        </span>
+        <button onClick={sair}>Desconectar</button>
+      </div>
+      {conta.usa_o_plano ? (
+        <small>
+          A cota do seu plano paga a reescrita. Acompanhe o consumo em{" "}
+          <b>ChatGPT → Configurações → Uso</b>.
+        </small>
+      ) : (
+        <p className="prov-erro">
+          ✗ Você entrou, mas não autorizou o uso do plano — a reescrita por aqui não vai
+          funcionar. Desconecte e conecte de novo, aceitando a permissão de uso do plano.
+        </p>
+      )}
+    </div>
+  );
+}
+
 function ProvidersTab({ s, patch }: TabProps) {
   const [estado, setEstado] = useState<Record<number, { testando?: boolean; r?: ProviderTest }>>({});
 
@@ -711,7 +836,35 @@ function ProvidersTab({ s, patch }: TabProps) {
     for (let n = 2; s.providers.some((p) => p.name === nome); n++) {
       nome = `${base.name} ${n}`;
     }
-    patch({ providers: [...s.providers, { name: nome, base_url: base.base_url, api_key: null, timeout_secs: 0 }] });
+    patch({
+      providers: [
+        ...s.providers,
+        { name: nome, base_url: base.base_url, api_key: null, timeout_secs: 0, kind: "api_key" },
+      ],
+    });
+  };
+
+  /// Medido em 07/10 no ditado clínico real: `luna:low` em 18,3s acertou as 7
+  /// checagens de fidelidade; `terra:medium` levou 27,2s para o mesmo acerto, e
+  /// o esforço alto passou de 60s **e piorou**. Por isso o padrão já vem pronto
+  /// em vez de deixar o campo vazio.
+  const adicionarChatgpt = () => {
+    let nome = "ChatGPT";
+    for (let n = 2; s.providers.some((p) => p.name === nome); n++) nome = `ChatGPT ${n}`;
+    patch({
+      providers: [
+        ...s.providers,
+        {
+          name: nome,
+          base_url: "https://api.openai.com/v1",
+          api_key: null,
+          // a Responses API pensa antes de responder; com o padrão de 4s nunca
+          // chegaria ao fim
+          timeout_secs: 60,
+          kind: "chatgpt_oauth",
+        },
+      ],
+    });
   };
 
   return (
@@ -746,30 +899,38 @@ function ProvidersTab({ s, patch }: TabProps) {
                 }}
               />
               {emUso && <span className="badge-uso">reescrita</span>}
-              <button onClick={() => testar(i)} disabled={st?.testando}>
-                {st?.testando ? "testando..." : "Testar"}
-              </button>
+              {!ehChatgpt(p) && (
+                <button onClick={() => testar(i)} disabled={st?.testando}>
+                  {st?.testando ? "testando..." : "Testar"}
+                </button>
+              )}
               <button className="danger" onClick={() => remover(i)}>
                 remover
               </button>
             </div>
 
-            <label className="field">
-              <span>Endereço base</span>
-              <input
-                value={p.base_url}
-                placeholder="https://exemplo.com/v1"
-                onChange={(e) => update(i, { base_url: e.target.value })}
-              />
-            </label>
+            {ehChatgpt(p) ? (
+              <ContaChatgptCard />
+            ) : (
+              <>
+                <label className="field">
+                  <span>Endereço base</span>
+                  <input
+                    value={p.base_url}
+                    placeholder="https://exemplo.com/v1"
+                    onChange={(e) => update(i, { base_url: e.target.value })}
+                  />
+                </label>
 
-            <label className="field">
-              <span>Chave da API</span>
-              <SecretInput
-                value={p.api_key ?? ""}
-                onChange={(v) => update(i, { api_key: v || null })}
-              />
-            </label>
+                <label className="field">
+                  <span>Chave da API</span>
+                  <SecretInput
+                    value={p.api_key ?? ""}
+                    onChange={(v) => update(i, { api_key: v || null })}
+                  />
+                </label>
+              </>
+            )}
 
             <label className="field">
               <span>Tempo limite da reescrita</span>
@@ -810,6 +971,11 @@ function ProvidersTab({ s, patch }: TabProps) {
 
       <div className="prov-add">
         <button onClick={() => adicionar()}>+ Adicionar provedor</button>
+        {!s.providers.some(ehChatgpt) && (
+          <button onClick={adicionarChatgpt} title="usa a cota do seu plano ChatGPT">
+            + Continue with ChatGPT
+          </button>
+        )}
         {PRESETS.filter((p) => !s.providers.some((x) => x.base_url === p.base_url)).map((p) => (
           <button key={p.name} className="preset" onClick={() => adicionar(p)} title={p.nota}>
             + {p.name}
@@ -896,9 +1062,9 @@ function ProfilesTab({ s, patch }: TabProps) {
               rotulo="Provedor só deste perfil"
               provedor={p.rewrite_provider_name}
               modelo={p.rewrite_model}
-              aoTrocarProvedor={(v) =>
+              aoTrocarProvedor={(v, m) =>
                 // provedor em branco volta ao global, e aí o modelo não faz sentido
-                update(i, { rewrite_provider_name: v, ...(v ? {} : { rewrite_model: "" }) })
+                update(i, { rewrite_provider_name: v, rewrite_model: v ? m : "" })
               }
               aoTrocarModelo={(v) => update(i, { rewrite_model: v })}
               opcaoVazia="usar o provedor escolhido em Reescrita"
