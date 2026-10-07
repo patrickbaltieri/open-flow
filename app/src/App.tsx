@@ -765,6 +765,7 @@ function ModelPicker({
 
 const PRESETS: { name: string; base_url: string; nota: string }[] = [
   { name: "Groq", base_url: "https://api.groq.com/openai/v1", nota: "console.groq.com/keys" },
+  { name: "OpenAI", base_url: "https://api.openai.com/v1", nota: "platform.openai.com/api-keys" },
   { name: "OpenRouter", base_url: "https://openrouter.ai/api/v1", nota: "openrouter.ai/keys" },
   { name: "Gemini", base_url: "https://generativelanguage.googleapis.com/v1beta/openai", nota: "aistudio.google.com/apikey" },
   { name: "OmniRoute", base_url: "https://omniroute.ihub.click/v1", nota: "seu gateway" },

@@ -731,11 +731,35 @@ fn ensure_sidecar(shared: &Shared, s: &Settings) -> Result<(), String> {
 
 /// Transcrição por qualquer provedor com `/audio/transcriptions` no formato
 /// da OpenAI — mesmo multipart usado hoje com a Groq, só muda o endereço.
+/// Dicionário do usuário como pista de vocabulário para quem transcreve.
+///
+/// Vai no campo `prompt`, e só nele. Medido em 07/10 contra os provedores
+/// reais: `prompt` é aceito pela Groq e pelo OpenRouter, nos dois modelos
+/// testados; `keywords` — o campo que o `gpt-transcribe` tem para termos de
+/// domínio — devolve `HTTP 400 unknown param` na Groq. Um campo que derruba o
+/// ditado em um provedor não compensa o ganho no outro.
+///
+/// Razão de existir: no ditado clínico de teste, `whisper-large-v3-turbo`
+/// escreveu "dexometasona" e "clavonato" — nomes de medicamento errados num
+/// texto que vai para prontuário — e ambos os modelos erraram "radix
+/// entomolaris". São termos que o usuário já cadastra para a reescrita; usá-los
+/// também aqui não custa nada.
+fn vocabulario(s: &Settings) -> Option<String> {
+    let termos: Vec<&str> =
+        s.dictionary.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    if termos.is_empty() {
+        None
+    } else {
+        Some(termos.join(", "))
+    }
+}
+
 fn transcribe_openai(
     wav: Vec<u8>,
     p: &Provider,
     model: &str,
     lang: &str,
+    vocab: Option<&str>,
 ) -> Result<String, String> {
     if p.kind == ProviderKind::ChatgptOauth {
         // Não é limitação do app: o fluxo de uso do plano recusa áudio e o
@@ -759,6 +783,9 @@ fn transcribe_openai(
         .text("response_format", "json");
     if lang != "auto" {
         form = form.text("language", lang.to_string());
+    }
+    if let Some(v) = vocab.filter(|v| !v.is_empty()) {
+        form = form.text("prompt", v.to_string());
     }
     let mut req = cloud_client()
         .post(p.url("audio/transcriptions"))
@@ -793,6 +820,9 @@ fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
         .text("response_format", "json");
     if s.speech_lang != "auto" {
         form = form.text("language", s.speech_lang.clone());
+    }
+    if let Some(v) = vocabulario(s) {
+        form = form.text("prompt", v);
     }
     let resp = cloud_client()
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
@@ -849,7 +879,13 @@ fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, S
     // provedor escolhido na aba Provedores tem prioridade
     if !s.stt_provider_name.is_empty() {
         match s.providers.iter().find(|p| p.name == s.stt_provider_name) {
-            Some(p) => match transcribe_openai(wav.clone(), p, &s.stt_model, &s.speech_lang) {
+            Some(p) => match transcribe_openai(
+                wav.clone(),
+                p,
+                &s.stt_model,
+                &s.speech_lang,
+                vocabulario(s).as_deref(),
+            ) {
                 Ok(t) => {
                     println!("[stt] transcrito via {} ({})", p.name, s.stt_model);
                     return Ok(t);
@@ -2604,6 +2640,26 @@ mod tests {
         assert!(e.contains("modelo"), "modelo vazio tem de ser dito, não virar 404: {e}");
     }
 
+    /// `prompt` é o único campo de vocabulário que todos aceitam. Medido em
+    /// 07/10 contra os provedores reais: `keywords` devolve
+    /// `HTTP 400 unknown param` na Groq, e um campo que derruba o ditado num
+    /// provedor não compensa o ganho no outro.
+    #[test]
+    fn dicionario_vira_pista_de_vocabulario() {
+        let mut s = Settings::default();
+        assert!(vocabulario(&s).is_none(), "dicionário vazio não manda campo nenhum");
+
+        s.dictionary = vec![
+            "radix entomolaris".into(),
+            "  ".into(), // linha em branco que o usuário deixou
+            "AH Plus Jet".into(),
+            "dexametasona".into(),
+        ];
+        let v = vocabulario(&s).expect("com termos, vira pista");
+        assert_eq!(v, "radix entomolaris, AH Plus Jet, dexametasona");
+        assert!(!v.contains("  ,"), "entrada vazia não pode virar vírgula solta");
+    }
+
     /// O esforço viaja no nome do modelo para atravessar seletor, perfil e
     /// histórico sem campo novo. Modelo sem `:` continua valendo como sempre.
     #[test]
@@ -2628,7 +2684,7 @@ mod tests {
             timeout_secs: 60,
             kind: ProviderKind::ChatgptOauth,
         };
-        let e = transcribe_openai(vec![0u8; 64], &p, "gpt-5.6-luna", "pt").unwrap_err();
+        let e = transcribe_openai(vec![0u8; 64], &p, "gpt-5.6-luna", "pt", None).unwrap_err();
         assert!(e.contains("não transcreve"), "precisa dizer o motivo: {e}");
         assert!(e.contains("ChatGPT"), "precisa nomear o provedor: {e}");
     }
