@@ -15,6 +15,9 @@ export interface Profile {
   style: string;
   hotkey: string;
   hotkey_mode: string;
+  /// provedor de reescrita só deste perfil; vazio usa o global
+  rewrite_provider_name: string;
+  rewrite_model: string;
 }
 
 export interface Snippet {
@@ -880,18 +883,48 @@ function ProfilesTab({ s, patch }: TabProps) {
               <option value="toggle">apertar para iniciar/parar</option>
             </select>
           </div>
+          <details className="profile-rewrite">
+            <summary>
+              Reescrita:{" "}
+              {p.rewrite_provider_name
+                ? `${p.rewrite_provider_name} / ${p.rewrite_model || "sem modelo"}`
+                : "igual ao resto do app"}
+            </summary>
+            <ModelPicker
+              s={s}
+              patch={patch}
+              rotulo="Provedor só deste perfil"
+              provedor={p.rewrite_provider_name}
+              modelo={p.rewrite_model}
+              aoTrocarProvedor={(v) =>
+                // provedor em branco volta ao global, e aí o modelo não faz sentido
+                update(i, { rewrite_provider_name: v, ...(v ? {} : { rewrite_model: "" }) })
+              }
+              aoTrocarModelo={(v) => update(i, { rewrite_model: v })}
+              opcaoVazia="usar o provedor escolhido em Reescrita"
+              ajuda="Troca qualidade por tempo neste perfil só. Anotação que vai para prontuário aceita esperar por um modelo mais cuidadoso; ditado corrido, não."
+            />
+          </details>
         </div>
       ))}
       <p className="hint">
         O atalho próprio dita direto no estilo daquele perfil, sem trocar o perfil ativo. Clique
-        no campo e tecle a combinação; comece pelos modificadores.
+        no campo e tecle a combinação; comece pelos modificadores. Em <b>Reescrita</b>, cada
+        perfil pode usar um provedor diferente do resto do app.
       </p>
       <button
         onClick={() =>
           patch({
             profiles: [
               ...s.profiles,
-              { name: "Novo perfil", style: "", hotkey: "", hotkey_mode: "hold" },
+              {
+                name: "Novo perfil",
+                style: "",
+                hotkey: "",
+                hotkey_mode: "hold",
+                rewrite_provider_name: "",
+                rewrite_model: "",
+              },
             ],
           })
         }

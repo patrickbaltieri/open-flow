@@ -32,6 +32,20 @@ struct Profile {
     hotkey: String,
     /// "hold" (padrão) ou "toggle"
     hotkey_mode: String,
+    /// Provedor de reescrita só deste perfil; vazio usa o global.
+    ///
+    /// Existe porque qualidade e latência estão em troca direta, e o ponto de
+    /// equilíbrio é diferente em cada perfil. Medido em 07/10 no mesmo ditado
+    /// clínico de 2.872 caracteres: `gpt-oss-120b` pela Groq respondeu em 8,4s
+    /// mas escreveu "desobturção da restauração" onde a fala dizia "remoção da
+    /// resina" — erro que não pode ir para prontuário; `gpt-5.6-terra` acertou
+    /// as 8 seções do perfil sem erro, em 33,3s. Escolha global condenaria um
+    /// dos dois: anotação de prontuário aceita esperar, ditado corrido não.
+    rewrite_provider_name: String,
+    /// Modelo de reescrita deste perfil. Só vale com `rewrite_provider_name`
+    /// preenchido, e aí é obrigatório: o modelo global pertence a outro
+    /// provedor e daria 404 sem explicar o motivo.
+    rewrite_model: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -125,6 +139,7 @@ fn default_profiles() -> Vec<Profile> {
         style: style.into(),
         hotkey: String::new(),
         hotkey_mode: "hold".into(),
+        ..Default::default()
     };
     vec![
         p("Bruto corrigido", "coringa do dia a dia (resposta de conversa, WhatsApp, prompt para IA): texto natural com o tom e as palavras do falante preservados."),
@@ -877,7 +892,44 @@ fn build_prompt(s: &Settings, profile: &str) -> String {
     p
 }
 
+/// Decide quem reescreve um perfil. `Ok(None)` significa "sem escolha própria,
+/// usa o provedor global".
+///
+/// Separada do `rewrite` para poder ser testada: a reescrita em si faz chamada
+/// de rede, a escolha de quem chamar não.
+fn alvo_do_perfil<'a>(
+    s: &'a Settings,
+    profile: &str,
+) -> Result<Option<(&'a Provider, &'a str)>, String> {
+    let prof = match s.profiles.iter().find(|p| p.name == profile) {
+        Some(p) => p,
+        // perfil que não existe mais: o global resolve, não é motivo de erro
+        None => return Ok(None),
+    };
+    if prof.rewrite_provider_name.is_empty() {
+        return Ok(None);
+    }
+    if prof.rewrite_model.is_empty() {
+        return Err(format!(
+            "perfil '{}' tem provedor '{}' mas nenhum modelo escolhido",
+            profile, prof.rewrite_provider_name
+        ));
+    }
+    match s.providers.iter().find(|p| p.name == prof.rewrite_provider_name) {
+        Some(p) => Ok(Some((p, prof.rewrite_model.as_str()))),
+        None => Err(format!(
+            "perfil '{}' aponta para o provedor '{}', que não existe mais na aba Provedores",
+            profile, prof.rewrite_provider_name
+        )),
+    }
+}
+
 fn rewrite(raw: &str, s: &Settings, profile: &str) -> Result<String, String> {
+    // Escolha do perfil ganha da global: é a mais específica, pela mesma lógica
+    // que ordena os atalhos do mais específico para o mais genérico.
+    if let Some((p, modelo)) = alvo_do_perfil(s, profile)? {
+        return rewrite_openai(raw, s, profile, p, modelo);
+    }
     if !s.rewrite_provider_name.is_empty() {
         match s.providers.iter().find(|p| p.name == s.rewrite_provider_name) {
             Some(p) => return rewrite_openai(raw, s, profile, p, &s.rewrite_model),
@@ -2370,6 +2422,82 @@ mod tests {
                                api_key: None, timeout_secs: 12 };
         assert_eq!(lento.timeout(), Duration::from_secs(12));
         assert!(lento.timeout() > padrao.timeout());
+    }
+
+    /// Monta um Settings com dois provedores e um perfil que aponta para o
+    /// segundo, para exercitar a escolha por perfil sem tocar a rede.
+    fn settings_com_perfil(provedor: &str, modelo: &str) -> Settings {
+        let mut s = Settings::default();
+        s.providers = vec![
+            Provider { name: "Groq".into(), base_url: "https://groq/v1".into(),
+                       api_key: None, timeout_secs: 0 },
+            Provider { name: "Omniroute".into(), base_url: "https://omni/v1".into(),
+                       api_key: None, timeout_secs: 12 },
+        ];
+        s.rewrite_provider_name = "Groq".into();
+        s.rewrite_model = "openai/gpt-oss-120b".into();
+        s.profiles = vec![
+            Profile { name: "Bruto corrigido".into(), hotkey_mode: "hold".into(),
+                      ..Default::default() },
+            Profile { name: "Anotção clínica".into(), hotkey_mode: "hold".into(),
+                      rewrite_provider_name: provedor.into(),
+                      rewrite_model: modelo.into(), ..Default::default() },
+        ];
+        s
+    }
+
+    /// A razão de existir da escolha por perfil. Medido em 07/10 no mesmo ditado
+    /// clínico de 2.872 caracteres: a Groq responde em 8,4s mas escreveu
+    /// "desobturção da restauração" onde a fala dizia "remoção da resina";
+    /// gpt-5.6-terra acertou as 8 seções do perfil, em 33,3s. Um perfil aceita
+    /// esperar, o outro não.
+    #[test]
+    fn perfil_com_provedor_proprio_ganha_do_global() {
+        let s = settings_com_perfil("Omniroute", "codex/gpt-5.6-terra-medium");
+
+        let (p, modelo) = alvo_do_perfil(&s, "Anotção clínica")
+            .expect("escolha válida")
+            .expect("perfil tem provedor próprio");
+        assert_eq!(p.name, "Omniroute");
+        assert_eq!(modelo, "codex/gpt-5.6-terra-medium");
+        assert_eq!(p.timeout(), Duration::from_secs(12), "leva o teto do provedor do perfil");
+
+        assert!(
+            alvo_do_perfil(&s, "Bruto corrigido").unwrap().is_none(),
+            "perfil sem escolha própria cai no global"
+        );
+    }
+
+    /// Configuração antiga não tem os campos novos, e perfil apagado não pode
+    /// derrubar o ditado: nos dois casos o global resolve.
+    #[test]
+    fn perfil_sem_escolha_ou_inexistente_usa_o_global() {
+        let s = settings_com_perfil("", "");
+        assert!(alvo_do_perfil(&s, "Anotção clínica").unwrap().is_none());
+        assert!(alvo_do_perfil(&s, "perfil que não existe").unwrap().is_none());
+        for prof in &Settings::default().profiles {
+            assert!(prof.rewrite_provider_name.is_empty(), "padrão não força provedor");
+        }
+    }
+
+    /// Falhar calado já custou dias duas vezes. Provedor removido sem limpar o
+    /// perfil, ou provedor escolhido sem modelo, precisa dizer o que está errado
+    /// — o texto bruto ainda é colado, mas com o motivo no balão.
+    #[test]
+    fn escolha_quebrada_no_perfil_explica_o_motivo() {
+        // `unwrap_err` exigiria Debug em Provider, e Provider carrega a chave de
+        // API: um panic imprimiria a chave. Casar à mão sai mais barato que isso.
+        let erro = |s: &Settings| match alvo_do_perfil(s, "Anotção clínica") {
+            Err(e) => e,
+            Ok(_) => panic!("escolha quebrada tinha de falhar, não seguir calada"),
+        };
+
+        let e = erro(&settings_com_perfil("Provedor apagado", "qualquer-modelo"));
+        assert!(e.contains("Anotção clínica") && e.contains("Provedor apagado"),
+                "precisa nomear o perfil e o provedor: {e}");
+
+        let e = erro(&settings_com_perfil("Omniroute", ""));
+        assert!(e.contains("modelo"), "modelo vazio tem de ser dito, não virar 404: {e}");
     }
 
     /// Medido: gpt-5.6-terra-medium leva 4,6-5,6s pelo OmniRoute. Com o teto de

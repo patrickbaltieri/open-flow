@@ -217,6 +217,56 @@ recusou a colagem".
 
 ---
 
+## 10. Provedor de reescrita por perfil
+
+**Onde:** `Profile.rewrite_provider_name` / `Profile.rewrite_model`,
+`alvo_do_perfil()`, o `<details class="profile-rewrite">` no `ProfilesTab`.
+
+O upstream tem uma escolha só de reescrita, global. Aqui cada perfil pode
+apontar para outro provedor e outro modelo; vazio usa o global, então
+configuração antiga continua valendo sem migração.
+
+**Por que existe.** Qualidade e latência estão em troca direta, e o ponto de
+equilíbrio muda por perfil. Medido em 07/10/2026 no mesmo ditado clínico real
+(2.872 caracteres de transcrição, prompt de 9.154 com o estilo do perfil):
+
+| Provedor / modelo | Tempo | Fidelidade ao que foi falado |
+|---|---|---|
+| Groq `openai/gpt-oss-120b` | **8,4 s** | 2 de 5 checagens |
+| OpenRouter `openai/gpt-5.6-luna` | 11,6 s | **5 de 5** |
+| OpenRouter `openai/gpt-5.6-terra` | 12,4 s | **5 de 5** |
+| OpenRouter `openai/gpt-6.1-sol` | 16,8 s | 5 de 5, mas estrutura pior |
+| Codex CLI `gpt-5.6-terra` (assinatura) | 33,3 s | 5 de 5 |
+
+A falha da Groq não é de estilo. Ela escreveu **"Desobturção completa da
+restauração antiga"** onde a fala dizia "remoção completa da resina antiga" —
+desobturação é de canal radicular, não de restauração, e a palavra saiu sem o
+"a". Também omitiu a queixa que foi dita ("nenhuma queixa maior do paciente") e
+a ressalva das trincas ("sem relação com bolsa periodontal no momento"), e
+injeta hífen não separável (U+2011) em "guta‑percha", caractere invisível que
+viaja para o prontuário.
+
+Nenhum dos dois extremos serve para tudo: anotação que vai para prontuário
+aceita esperar 12 s por um texto sem erro clínico; ditado corrido não aceita, e
+a Groq resolve.
+
+**Cuidado:** o teto é por **provedor** (item 7), não por perfil. Apontar um
+perfil para um provedor lento sem subir o `timeout_secs` dele reproduz o
+problema do gateway: estoura, retenta, estoura, e cola texto bruto.
+
+**Separada do `rewrite` de propósito:** `alvo_do_perfil()` só decide quem
+chamar, sem tocar a rede, e por isso é testável. `Provider` **não** deriva
+`Debug` — carrega a chave de API, e um `unwrap_err` num teste a imprimiria.
+
+**Testes:** `perfil_com_provedor_proprio_ganha_do_global`,
+`perfil_sem_escolha_ou_inexistente_usa_o_global`,
+`escolha_quebrada_no_perfil_explica_o_motivo`.
+
+**Medições em** `open-flow-instalar/comparar-reescrita.txt` e
+`testar-omni-terra.txt`; scripts ao lado, reprodutíveis por tarefa agendada.
+
+---
+
 ## Procedimento de merge
 
 1. `git fetch --tags origin` e ver o que mudou: `git log --oneline HEAD..origin/main`

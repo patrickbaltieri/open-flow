@@ -414,6 +414,22 @@ button.link:hover {
   font-size: 0.85rem;
 }
 
+.profile-rewrite {
+  margin-top: 0.6rem;
+  border-top: 1px solid var(--border-soft);
+  padding-top: 0.5rem;
+}
+
+.profile-rewrite > summary {
+  margin-top: 0;
+}
+
+/* dentro do cartão o seletor não precisa da largura de uma aba inteira */
+.profile-rewrite .field {
+  max-width: 340px;
+  margin: 0.6rem 0 0;
+}
+
 .switch-row {
   display: flex;
   align-items: center;
