@@ -50,6 +50,10 @@ const ehChatgpt = (p?: Provider) => p?.kind === "chatgpt_oauth";
 /// edição fiel não melhora com mais raciocínio.
 const PADRAO_CHATGPT = "gpt-5.6-luna:low";
 
+/// Valor sentinela da lista de modelos: cair no campo livre. Começa com
+/// espaço para nunca colidir com um nome de modelo real.
+const OUTRO = " __outro__";
+
 interface ProviderTest {
   ok: boolean;
   models: string[];
@@ -590,12 +594,15 @@ function ModelPicker({
   const [resultado, setResultado] = useState<ProviderTest | null>(null);
   const [carregando, setCarregando] = useState(false);
   const [verTodos, setVerTodos] = useState(false);
+  /// volta ao campo livre quando o modelo que ele quer não está no catálogo
+  const [digitando, setDigitando] = useState(false);
   const atual = s.providers.find((p) => p.name === provedor);
   const idLista = `modelos-${rotulo.replace(/\W+/g, "-")}`;
 
   useEffect(() => {
     setResultado(null);
     setVerTodos(false);
+    setDigitando(false);
   }, [provedor]);
 
   const carregar = async () => {
@@ -686,14 +693,42 @@ function ModelPicker({
         <label className="field">
           <span>Modelo</span>
           <div className="modelo-linha">
-            <input
-              list={idLista}
-              value={modelo}
-              placeholder="digite ou carregue a lista"
-              onChange={(e) => aoTrocarModelo(e.target.value)}
-            />
+            {modelos.length > 0 && !digitando ? (
+              // Com catálogo na mão, uma lista de verdade. O `datalist` filtra
+              // pelo texto que já está no campo, então um modelo escolhido
+              // escondia todos os outros — parecia catálogo truncado.
+              <select
+                value={modelos.includes(modelo) ? modelo : ""}
+                onChange={(e) => {
+                  if (e.target.value === OUTRO) {
+                    setDigitando(true);
+                  } else {
+                    aoTrocarModelo(e.target.value);
+                  }
+                }}
+              >
+                {!modelos.includes(modelo) && (
+                  <option value="">
+                    {modelo ? `${modelo} (fora da lista)` : "— escolha um modelo —"}
+                  </option>
+                )}
+                {modelos.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+                <option value={OUTRO}>outro — digitar à mão</option>
+              </select>
+            ) : (
+              <input
+                list={idLista}
+                value={modelo}
+                placeholder="digite ou carregue a lista"
+                onChange={(e) => aoTrocarModelo(e.target.value)}
+              />
+            )}
             <button onClick={carregar} disabled={carregando}>
-              {carregando ? "..." : "Carregar modelos"}
+              {carregando ? "..." : modelos.length > 0 ? "Recarregar" : "Carregar modelos"}
             </button>
           </div>
           <datalist id={idLista}>
