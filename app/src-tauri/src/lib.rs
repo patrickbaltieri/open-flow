@@ -98,6 +98,18 @@ impl Provider {
         format!("{}/{}", self.base_url.trim_end_matches('/'), caminho.trim_start_matches('/'))
     }
 
+    /// A Anthropic exige `anthropic-version` nas rotas nativas. Medido em
+    /// 14/10 contra a API real: `/chat/completions` — a camada de
+    /// compatibilidade com o dialeto OpenAI — responde sem o header, mas
+    /// `/models` devolve `400 anthropic-version: header is required`, e era
+    /// isso que quebrava o botão de carregar modelos.
+    ///
+    /// Restrito ao host dela pelo mesmo motivo do fallback do Gemini: header
+    /// que só um provedor entende não tem por que viajar para os outros.
+    fn precisa_versao_anthropic(&self) -> bool {
+        self.base_url.contains("api.anthropic.com")
+    }
+
     /// teto desta chamada; sem valor próprio, usa o padrão
     fn timeout(&self) -> Duration {
         if self.timeout_secs == 0 {
@@ -276,6 +288,10 @@ fn settings_path() -> std::path::PathBuf {
 
 // --- Segredos: DPAPI (Windows) ⇄ Keychain (macOS); no disco fica "enc:..." ---
 const ENC_PREFIX: &str = "enc:";
+
+/// Versão da API da Anthropic. Ela trata isso como contrato: é o que garante
+/// que uma mudança futura no formato não quebre quem já está rodando.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// `name` identifica o item no cofre da plataforma (o Keychain precisa; o DPAPI ignora)
 pub(crate) fn decrypt_key(name: &str, v: &Option<String>) -> Option<String> {
@@ -1100,6 +1116,11 @@ fn rewrite_openai_uma_vez(
         .timeout(p.timeout())
         .header("accept", "application/json")
         .json(&body);
+    // a camada de compatibilidade aceita sem, mas mandar protege se ela passar
+    // a exigir, como as rotas nativas já exigem
+    if p.precisa_versao_anthropic() {
+        req = req.header("anthropic-version", ANTHROPIC_VERSION);
+    }
     if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
     }
@@ -1931,6 +1952,9 @@ fn test_provider(base_url: String, api_key: Option<String>) -> ProviderTest {
         };
     }
     let mut req = cloud_client().get(p.url("models")).header("accept", "application/json");
+    if p.precisa_versao_anthropic() {
+        req = req.header("anthropic-version", ANTHROPIC_VERSION);
+    }
     if let Some(k) = p.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(k);
     }
@@ -2638,6 +2662,25 @@ mod tests {
 
         let e = erro(&settings_com_perfil("Omniroute", ""));
         assert!(e.contains("modelo"), "modelo vazio tem de ser dito, não virar 404: {e}");
+    }
+
+    /// Medido em 14/10 contra a API real: `/chat/completions` da Anthropic
+    /// responde sem o header, mas `/models` devolve
+    /// `400 anthropic-version: header is required`. O header fica restrito ao
+    /// host dela — os outros provedores não o entendem e não têm por que vê-lo.
+    #[test]
+    fn so_a_anthropic_recebe_o_header_de_versao() {
+        let anthropic = Provider {
+            base_url: "https://api.anthropic.com/v1".into(),
+            ..Default::default()
+        };
+        assert!(anthropic.precisa_versao_anthropic());
+
+        for outro in ["https://api.groq.com/openai/v1", "https://openrouter.ai/api/v1",
+                      "https://api.openai.com/v1", "https://omniroute.ihub.click/v1"] {
+            let p = Provider { base_url: outro.into(), ..Default::default() };
+            assert!(!p.precisa_versao_anthropic(), "{outro} não deveria receber o header");
+        }
     }
 
     /// `prompt` é o único campo de vocabulário que todos aceitam. Medido em
