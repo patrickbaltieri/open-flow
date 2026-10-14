@@ -54,6 +54,20 @@ const PADRAO_CHATGPT = "gpt-5.6-luna:low";
 /// espaço para nunca colidir com um nome de modelo real.
 const OUTRO = " __outro__";
 
+/// O esforço viaja como sufixo do nome do modelo (`claude-haiku-5-5:low`), para
+/// atravessar seletor, escolha por perfil e histórico sem campo novo. Estas
+/// duas funções são o único lugar que sabe disso na interface.
+const semEsforco = (m: string) => m.split(":")[0];
+const soEsforco = (m: string) => m.split(":")[1] ?? "";
+const comEsforco = (m: string, e: string) => (e ? `${semEsforco(m)}:${e}` : semEsforco(m));
+
+const ESFORCOS = [
+  { v: "", rotulo: "padrão do provedor" },
+  { v: "low", rotulo: "baixo — mais rápido" },
+  { v: "medium", rotulo: "médio" },
+  { v: "high", rotulo: "alto — mais lento" },
+];
+
 interface ProviderTest {
   ok: boolean;
   models: string[];
@@ -698,16 +712,17 @@ function ModelPicker({
               // pelo texto que já está no campo, então um modelo escolhido
               // escondia todos os outros — parecia catálogo truncado.
               <select
-                value={modelos.includes(modelo) ? modelo : ""}
+                value={modelos.includes(semEsforco(modelo)) ? semEsforco(modelo) : ""}
                 onChange={(e) => {
                   if (e.target.value === OUTRO) {
                     setDigitando(true);
                   } else {
-                    aoTrocarModelo(e.target.value);
+                    // preserva o esforço já escolhido ao trocar de modelo
+                    aoTrocarModelo(comEsforco(e.target.value, soEsforco(modelo)));
                   }
                 }}
               >
-                {!modelos.includes(modelo) && (
+                {!modelos.includes(semEsforco(modelo)) && (
                   <option value="">
                     {modelo ? `${modelo} (fora da lista)` : "— escolha um modelo —"}
                   </option>
@@ -730,6 +745,19 @@ function ModelPicker({
             <button onClick={carregar} disabled={carregando}>
               {carregando ? "..." : modelos.length > 0 ? "Recarregar" : "Carregar modelos"}
             </button>
+          </div>
+          <div className="modelo-linha esforco-linha">
+            <span className="unidade">Esforço</span>
+            <select
+              value={soEsforco(modelo)}
+              onChange={(e) => aoTrocarModelo(comEsforco(modelo, e.target.value))}
+            >
+              {ESFORCOS.map((e) => (
+                <option key={e.v} value={e.v}>
+                  {e.rotulo}
+                </option>
+              ))}
+            </select>
           </div>
           <datalist id={idLista}>
             {modelos.map((m) => (

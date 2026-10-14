@@ -659,3 +659,12 @@ details summary {
   align-self: center;
   flex: 1;
 }
+
+.esforco-linha {
+  margin-top: 0.45rem;
+}
+
+.esforco-linha select {
+  width: auto;
+  flex: 1;
+}

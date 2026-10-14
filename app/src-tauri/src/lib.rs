@@ -1007,6 +1007,28 @@ fn alvo_do_perfil<'a>(
     }
 }
 
+/// Modelos que já recusaram `temperature`, para não pagar a ida perdida de novo.
+///
+/// Cresce em uso, nunca encolhe: um modelo que recusa o campo hoje não volta a
+/// aceitá-lo. Vive só na memória do processo — na próxima abertura do app a
+/// primeira chamada daquele modelo descobre de novo, o que custa uma
+/// retentativa e evita guardar no disco uma lista que envelhece sozinha.
+static SEM_TEMPERATURA: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn sem_temperatura(model: &str) -> bool {
+    SEM_TEMPERATURA
+        .get_or_init(Default::default)
+        .lock()
+        .map(|c| c.contains(model))
+        .unwrap_or(false)
+}
+
+fn marcar_sem_temperatura(model: &str) {
+    if let Ok(mut c) = SEM_TEMPERATURA.get_or_init(Default::default).lock() {
+        c.insert(model.to_string());
+    }
+}
+
 /// Separa o esforço de raciocínio do nome do modelo: `gpt-5.6-luna:low`.
 ///
 /// Vai no próprio nome em vez de virar campo novo porque atravessa tudo que já
@@ -1104,13 +1126,34 @@ fn rewrite_openai_uma_vez(
     if model.trim().is_empty() {
         return Err(format!("nenhum modelo escolhido para o provedor '{}'", p.name));
     }
-    let body = serde_json::json!({
+    // guardado para a retentativa: ela repete a chamada inteira, e o sufixo de
+    // esforço faz parte do que o usuário escolheu
+    let model_original = model;
+    let (model, esforco) = modelo_e_esforco(model);
+    let mut body = serde_json::json!({
         "model": model,
-        "temperature": 0.2,
         // sem isto o OmniRoute responde em SSE e o corpo deixa de ser JSON
         "stream": false,
         "messages": [{"role": "user", "content": format!("{}{}", build_prompt(s, profile), raw)}]
     });
+    // `temperature` baixa mantém a reescrita previsível, mas modelo que pensa
+    // antes de responder rejeita o campo — o claude-haiku-5-5 devolve
+    // `400 temperature is deprecated for this model`. Quem já falhou uma vez
+    // entra no conjunto e não paga a ida perdida de novo.
+    if !sem_temperatura(model) {
+        body["temperature"] = serde_json::json!(0.2);
+    }
+    // `reasoning_effort` é o campo do dialeto OpenAI, e é o que a camada de
+    // compatibilidade da Anthropic entende. Medido em 14/10 no prompt clínico
+    // com claude-haiku-5-5: `low` gastou 2.951 tokens de saída contra 3.681 do
+    // `high`. O campo nativo dela (`output_config.effort`) é aceito mas
+    // ignorado — a variação saiu na direção errada, que é ruído.
+    //
+    // Provedor que não conhece o campo ignora em silêncio, que é o
+    // comportamento normal para campo desconhecido nesse dialeto.
+    if !esforco.is_empty() {
+        body["reasoning_effort"] = serde_json::Value::String(esforco.to_string());
+    }
     let mut req = rewrite_client()
         .post(p.url("chat/completions"))
         .timeout(p.timeout())
@@ -1153,6 +1196,18 @@ fn rewrite_openai_uma_vez(
     let v: serde_json::Value = serde_json::from_str(&corpo)
         .map_err(|_| format!("{} respondeu HTTP {status} sem JSON: {}", p.name, corta(&corpo)))?;
     if let Some(msg) = v["error"]["message"].as_str() {
+        // Modelo que recusa `temperature`: anota e repete sem o campo. A segunda
+        // chamada já sai correta, e da próxima vez o campo nem é enviado.
+        // `!sem_temperatura` fecha a recursão: se o campo já não foi enviado, a
+        // queixa é outra e repetir só daria o mesmo erro para sempre.
+        if !status.is_success()
+            && msg.to_lowercase().contains("temperature")
+            && !sem_temperatura(model)
+        {
+            eprintln!("[{}] {model} recusa temperature; repetindo sem o campo", p.name);
+            marcar_sem_temperatura(model);
+            return rewrite_openai_uma_vez(raw, s, profile, p, model_original);
+        }
         return Err(format!("{} (reescrita): {msg}", p.name));
     }
     if !status.is_success() {
@@ -1917,18 +1972,11 @@ fn siwc_desconectar() -> Result<(), String> {
     siwc::desconectar()
 }
 
-/// Catálogo da assinatura, já com as variantes de esforço que o app aceita no
-/// nome do modelo.
+/// Catálogo da assinatura. Devolve os modelos puros: o esforço virou seletor
+/// próprio na interface, que monta o sufixo `modelo:esforço` sozinha.
 #[tauri::command]
 fn siwc_modelos() -> Result<Vec<String>, String> {
-    let base = siwc::modelos()?;
-    let mut fora = Vec::with_capacity(base.len() * 3);
-    for m in base {
-        for e in ["low", "medium", "high"] {
-            fora.push(format!("{m}:{e}"));
-        }
-    }
-    Ok(fora)
+    siwc::modelos()
 }
 
 #[tauri::command]
@@ -2662,6 +2710,20 @@ mod tests {
 
         let e = erro(&settings_com_perfil("Omniroute", ""));
         assert!(e.contains("modelo"), "modelo vazio tem de ser dito, não virar 404: {e}");
+    }
+
+    /// O `claude-haiku-5-5` devolve `400 temperature is deprecated for this
+    /// model`, e o app mandava `temperature: 0.2` em toda reescrita — ou seja,
+    /// a reescrita pela Anthropic estava quebrada. Quem recusa entra no
+    /// conjunto e não paga a ida perdida de novo.
+    #[test]
+    fn modelo_que_recusa_temperatura_e_lembrado() {
+        let modelo = "modelo-de-teste-temperatura";
+        assert!(!sem_temperatura(modelo), "não pode nascer no conjunto");
+        marcar_sem_temperatura(modelo);
+        assert!(sem_temperatura(modelo));
+        // o conjunto é por modelo, não global
+        assert!(!sem_temperatura("outro-modelo-qualquer"));
     }
 
     /// Medido em 14/10 contra a API real: `/chat/completions` da Anthropic
