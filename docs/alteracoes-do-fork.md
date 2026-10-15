@@ -267,6 +267,145 @@ chamar, sem tocar a rede, e por isso é testável. `Provider` **não** deriva
 
 ---
 
+## 11. Conexão com o ChatGPT pela assinatura (Sign in with ChatGPT)
+
+**Onde:** `siwc.rs` inteiro, `ProviderKind::ChatgptOauth`, `rewrite_no_provedor()`,
+`ContaChatgptCard` no `App.tsx`.
+
+Usa o caminho de cliente open-source/local, que a OpenAI abriu sem lista de
+espera: a primeira autorização vai com `client_id=dynamic_agent_client` e o
+servidor emite um client próprio. Sem client secret, sem chave de parceiro.
+
+**Não transcreve.** A documentação do fluxo recusa áudio e o endpoint de
+transcrição, e isso foi **verificado com controle positivo**: o mesmo token
+recém-renovado funciona em `/responses` e devolve `401` em
+`/audio/transcriptions`. O provedor nem aparece no seletor de transcrição.
+
+Três coisas só apareceram testando contra o servidor real, com o protótipo em
+`open-flow-instalar/siwc-prototipo.py`:
+
+- o `aud` do ID token é **lista**, não string;
+- `/v1/models` devolve `{"models":[...]}` com `slug`/`display_name`, não o
+  `{"data":[...]}` do dialeto comum;
+- abrir o navegador por `cmd /c start` quebra a URL em cada `&`, e o servidor
+  recusa com `invalid_authorize_request`.
+
+**Decisão consciente sobre o ID token:** emissor, audiência, expiração e nonce
+são conferidos; a assinatura **não**. O token chega na resposta do token
+endpoint, por HTTPS direto nosso com `auth.openai.com`, sem passar pelo
+navegador — o canal já autentica o emissor. Se um dia ele passar a vir pelo
+navegador, a validação de assinatura vira obrigatória.
+
+**Credenciais** ficam em `chatgpt.json`, fora do `settings.json`: o settings vai
+inteiro para o frontend em `load_settings`, e token de acesso não pode viajar
+para lá.
+
+**Vale a pena?** Medido em 14/10 no mesmo prompt clínico, o `gpt-5.6-luna:low`
+levou **20,9 s pela assinatura** e **7,0 s pelo OpenRouter**, com qualidade
+indistinguível. A assinatura ficou como alternativa, não como caminho padrão.
+
+**Testes:** `pkce_segue_o_vetor_do_rfc_7636`, `audiencia_aceita_lista_e_string`,
+`host_id_e_opaco_e_estavel`, `erros_de_cota_viram_texto_legivel`,
+`query_do_callback_decodifica_porcento`, `encode_escapa_o_que_precisa`,
+`chatgpt_recusa_transcricao_com_motivo`, `provedor_sem_tipo_continua_sendo_de_chave`.
+
+---
+
+## 12. Esforço de raciocínio como seletor
+
+**Onde:** `modelo_e_esforco()`, `reasoning_effort` no corpo de
+`rewrite_openai_uma_vez()`, e o `<select>` de esforço no `ModelPicker`.
+
+O esforço viaja como **sufixo do nome do modelo** (`claude-haiku-5-5:low`), o
+que o faz atravessar seletor, escolha por perfil e histórico sem campo novo nem
+migração. Quem monta o sufixo é a interface; o backend separa e manda
+`reasoning_effort`.
+
+Medido em 14/10 na camada de compatibilidade da Anthropic, `claude-haiku-5-5`
+no prompt clínico: `low` gastou 2.951 tokens de saída, `high` 3.681. O campo
+nativo dela (`output_config.effort`) é aceito mas **ignorado** — a variação saiu
+na direção errada, que é ruído. `thinking` é rejeitado com mensagem explícita, o
+que confirma que a camada conhece esses campos.
+
+**Cuidado:** a primeira versão embutia as variantes no catálogo
+(`modelo:low`, `modelo:medium`, `modelo:high`), o que triplicava uma lista de
+465 modelos no OpenRouter e não valia para provedor de chave.
+
+---
+
+## 13. `temperature` condicional
+
+**Onde:** `SEM_TEMPERATURA`, `sem_temperatura()`, `marcar_sem_temperatura()`, e a
+retentativa em `rewrite_openai_uma_vez()`.
+
+O app mandava `temperature: 0.2` em toda reescrita. O `claude-haiku-5-5`
+responde `400 temperature is deprecated for this model` — **a reescrita pela
+Anthropic estava quebrada**, e só apareceu quando se testou pelo caminho do app
+em vez de um script que não mandava o campo.
+
+Modelo que pensa antes de responder rejeita o parâmetro; a OpenAI fez o mesmo
+nos modelos de raciocínio dela. Por isso a correção é genérica — detecta a
+recusa em qualquer provedor — e não uma exceção para `api.anthropic.com`.
+
+Quem recusa entra num conjunto em memória e a chamada é repetida sem o campo.
+A condição `!sem_temperatura(model)` fecha a recursão: sem ela, um erro que
+mencionasse "temperature" por outro motivo repetiria para sempre. O conjunto
+não vai para o disco — na próxima abertura a primeira chamada descobre de novo,
+o que custa uma retentativa e evita guardar uma lista que envelhece sozinha.
+
+**Teste:** `modelo_que_recusa_temperatura_e_lembrado`.
+
+---
+
+## 14. Header `anthropic-version`
+
+**Onde:** `Provider::precisa_versao_anthropic()`, `ANTHROPIC_VERSION`.
+
+Medido contra a API real: `/chat/completions` — a camada de compatibilidade com
+o dialeto OpenAI — responde **sem** o header; `/models` devolve
+`400 anthropic-version: header is required`. Era isso que quebrava o botão de
+carregar modelos.
+
+Restrito a `api.anthropic.com` pelo mesmo motivo do fallback do Gemini: header
+que só um provedor entende não viaja para os outros.
+
+**Teste:** `so_a_anthropic_recebe_o_header_de_versao`.
+
+---
+
+## 15. Dicionário como pista de vocabulário na transcrição
+
+**Onde:** `vocabulario()`, o campo `prompt` em `transcribe_openai()` e
+`transcribe_groq()`.
+
+O dicionário só influenciava a reescrita. Agora vai também no pedido de
+transcrição.
+
+**Por quê:** no ditado clínico de teste a Groq escreveu "dexometasona" e
+"clavonato" — dois nomes de medicamento errados num texto que vai para
+prontuário. Com o dicionário, 7/12 termos viraram **11/12**.
+
+**Vai no `prompt` e só nele.** Testado contra os provedores reais:
+
+| provedor / modelo | sem vocabulário | `prompt` | `keywords` |
+|---|---|---|---|
+| Groq `whisper-large-v3-turbo` | aceita | aceita | **HTTP 400** |
+| OpenAI `gpt-transcribe` | aceita | aceita | HTTP 400 |
+| OpenRouter `gpt-transcribe` | aceita | **sem efeito** | sem efeito |
+
+`keywords` é o campo que o `gpt-transcribe` tem para termos de domínio, mas a
+Groq devolve `unknown param` e a própria OpenAI recusa nessa rota. Um campo que
+derruba o ditado num provedor não compensa o ganho no outro.
+
+**Descoberta separada:** o **OpenRouter descarta o `prompt`**. O mesmo
+`gpt-transcribe`, com a mesma pista, deu 12/12 direto na OpenAI e 10/12 pelo
+OpenRouter, com texto idêntico ao da chamada sem pista. Ele aceita o campo e não
+repassa.
+
+**Teste:** `dicionario_vira_pista_de_vocabulario`.
+
+---
+
 ## Procedimento de merge
 
 1. `git fetch --tags origin` e ver o que mudou: `git log --oneline HEAD..origin/main`
