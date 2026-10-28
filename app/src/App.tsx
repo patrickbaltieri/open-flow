@@ -113,6 +113,8 @@ export interface Settings {
   snippets: Snippet[];
   history_enabled: boolean;
   audio_keep_days: number;
+  /// pasta dos ditados "Salvar para o laudo"; vazio = %APPDATA%\OpenFlow\ditados
+  ditados_dir: string;
   python: string;
   sidecar: string;
   stt_port: number;
@@ -1163,9 +1165,23 @@ function ProfilesTab({ s, patch }: TabProps) {
               onChange={(e) => update(i, { stt_prompt: e.target.value })}
             />
             {p.save_only && (
-              <div className="history-controls">
-                <button onClick={() => invoke("open_ditados_dir")}>Abrir pasta de ditados</button>
-              </div>
+              <>
+                <label className="field">
+                  <span>Pasta dos ditados</span>
+                  <input
+                    value={s.ditados_dir ?? ""}
+                    placeholder="vazio: %APPDATA%\OpenFlow\ditados"
+                    onChange={(e) => patch({ ditados_dir: e.target.value })}
+                  />
+                  <small>
+                    Uma pasta sincronizada (a TOMO\ditados no Dropbox) deixa ditar num PC e fazer o laudo
+                    no outro. Vale para todos os perfis que salvam para o laudo.
+                  </small>
+                </label>
+                <div className="history-controls">
+                  <button onClick={() => invoke("open_ditados_dir")}>Abrir pasta de ditados</button>
+                </div>
+              </>
             )}
             <p className="hint">
               "Salvar para o laudo" grava cada ditado como .wav e .json (texto cru) na pasta de ditados, para

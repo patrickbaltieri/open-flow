@@ -177,6 +177,10 @@ struct Settings {
     /// dias que a cópia em disco de cada ditado fica guardada; 0 = não grava.
     /// Vale também para a pasta `ditados` (ver `prazo_ditados`).
     audio_keep_days: u32,
+    /// pasta dos ditados dos perfis "Salvar para o laudo"; vazio usa
+    /// `%APPDATA%\OpenFlow\ditados`. No TDOOFFICE e no TDOSTUDIO aponta para
+    /// `TOMO\ditados` no Dropbox: dita num PC, faz o laudo no outro.
+    ditados_dir: String,
     python: String,
     sidecar: String,
     stt_port: u16,
@@ -266,6 +270,7 @@ impl Default for Settings {
             history_enabled: true,
             // 7 cobre fim de semana e feriado até o laudo buscar o ditado
             audio_keep_days: 7,
+            ditados_dir: String::new(),
             // ponytail: caminhos desta máquina; viram recurso empacotado na fase 3
             python,
             sidecar,
@@ -1938,8 +1943,9 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                         let snap = g.profiles.iter().find(|p| p.name == nome).cloned();
                         (nome, snap)
                     };
+                    let pasta = ditados::dir(&shared.settings.lock().unwrap().ditados_dir);
                     pending_ditado =
-                        snap.as_ref().is_some_and(|p| p.save_only).then(|| ditados::Ditado::novo(nome.clone()));
+                        snap.as_ref().is_some_and(|p| p.save_only).then(|| ditados::Ditado::novo(pasta, nome.clone()));
                     pending_profile = Some(nome);
                     pending_snap = snap;
                     gravando = true;
@@ -1973,7 +1979,7 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                 Ok(Cmd::Stop) => {
                     // o overlay só sai depois da colagem: some antes = parece ter falhado
                     let forced_profile = pending_profile.take();
-                    let ditado = pending_ditado.take();
+                    let mut ditado = pending_ditado.take();
                     let snap = pending_snap.take();
                     gravando = false;
                     let (samples, rate) = rec.stop();
@@ -1993,7 +1999,7 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                     // cópia em disco ANTES do STT: se ele falhar, a fala ainda existe
                     // e o menu do ícone ou a aba Áudios transcrevem de novo
                     // "Salvar histórico localmente" desligado vale para o áudio também
-                    if let Some(d) = &ditado {
+                    if let Some(d) = ditado.as_mut() {
                         if let Err(e) = d.salvar_wav(&wav) {
                             eprintln!("[ditados] áudio não foi salvo: {e}");
                             toast_show(&app, &format!("áudio do laudo não foi salvo — {e}"));
@@ -2235,8 +2241,12 @@ fn save_settings(
     persist_settings(&settings)?;
     // prazo menor (ou "não guardar") vale na hora, sem esperar o ciclo de 6h
     if settings.audio_keep_days != state.settings.lock().unwrap().audio_keep_days {
-        audios::limpar_antigos(settings.audio_keep_days);
-        ditados::limpar_antigos(prazo_ditados(settings.audio_keep_days));
+        // fora do comando: pasta no Dropbox ou em rede pode demorar, e a tela travaria
+        let (keep, pasta) = (settings.audio_keep_days, ditados::dir(&settings.ditados_dir));
+        std::thread::spawn(move || {
+            audios::limpar_antigos(keep);
+            ditados::limpar_antigos(&pasta, prazo_ditados(keep));
+        });
     }
     *state.bindings.lock().unwrap() = build_bindings(&settings);
     *state.cancel.lock().unwrap() = parse_cancel_key(&settings.cancel_key);
@@ -2545,9 +2555,9 @@ fn transcribe_audio(state: tauri::State<'_, Arc<Shared>>, name: String) -> Resul
 }
 
 #[tauri::command]
-fn open_ditados_dir(app: AppHandle) -> Result<(), String> {
+fn open_ditados_dir(app: AppHandle, state: tauri::State<Arc<Shared>>) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    let d = ditados::dir();
+    let d = ditados::dir(&state.settings.lock().unwrap().ditados_dir);
     std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
     app.opener().open_path(d.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
@@ -3604,15 +3614,15 @@ pub fn run() {
             // porque o app passa dias aberto na bandeja sem reiniciar
             let shared_limpeza = shared_setup.clone();
             std::thread::spawn(move || loop {
-                let (keep, keep_d) = {
+                let (keep, keep_d, pasta_d) = {
                     let g = shared_limpeza.settings.lock().unwrap();
-                    (g.audio_keep_days, prazo_ditados(g.audio_keep_days))
+                    (g.audio_keep_days, prazo_ditados(g.audio_keep_days), ditados::dir(&g.ditados_dir))
                 };
                 let n = audios::limpar_antigos(keep);
                 if n > 0 {
                     println!("[audios] {n} arquivo(s) com mais de {keep} dias apagados");
                 }
-                let n = ditados::limpar_antigos(keep_d);
+                let n = ditados::limpar_antigos(&pasta_d, keep_d);
                 if n > 0 {
                     println!("[ditados] {n} arquivo(s) com mais de {keep_d} dias apagados");
                 }
