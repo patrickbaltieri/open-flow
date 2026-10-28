@@ -406,6 +406,113 @@ repassa.
 
 ---
 
+## 16. Áudio de cada ditado guardado em disco, com retranscrição
+
+**Onde:** `audios.rs` (inteiro), `enfileirar()`, `transcrever()` e
+`Cmd::Retranscribe` em `lib.rs`; item `transcribe_last` da bandeja; comandos
+`list_audios`, `read_audio`, `transcribe_audio`, `open_audio_dir`; aba Áudios
+em `App.tsx`; campo `audio_keep_days` (padrão 5).
+
+**Por quê:** o áudio só existia na memória. Quando o STT falhava (rede, Groq
+fora, teto estourado), a fala se perdia junto com o erro e não havia como
+recuperar. Agora o WAV de 16 kHz é gravado em `%APPDATA%\OpenFlow\audio\<ms>.wav`
+**antes** do STT; uma falha deixa `<ms>.falhou` com o motivo ao lado.
+
+- Bandeja → "Transcrever último áudio": mesmo fluxo de um ditado (overlay em
+  "processando", o usuário clica onde quer o texto, cola ali). Passa pela fila de
+  inserção em ordem do upstream.
+- Aba Áudios: lista com data, duração e selo "falhou"; Ouvir e Transcrever. O
+  texto vai só para o clipboard, porque o cursor está na janela de configurações.
+- Só grava com "Salvar histórico localmente" ligado. Limpeza no boot, a cada 6h
+  e na hora em que o prazo muda; "Não guardar" apaga o que havia.
+- A idade vem do nome do arquivo, não da data dele: copiar a pasta não adia a
+  limpeza.
+
+**Testes:** `audios::tests::*` (nome fora do padrão recusado — barra path
+traversal; limpeza por prazo; lista, duração, marca de falha e mais recente).
+
+---
+
+## 17. Barreira contra vazamento de chave no push
+
+**Onde:** `tools/varre_segredos.py` e `.git/hooks/pre-push` (local, não versionado:
+recriar em cada clone com o conteúdo abaixo).
+
+```sh
+#!/bin/sh
+exec python -I "$(git rev-parse --show-toplevel)/tools/varre_segredos.py"
+```
+
+Lê as chaves reais (abre o `enc:` do DPAPI pelo mesmo caminho do app) e procura
+cada valor, mais os padrões `sk-ant-`, `sk-`, `gsk_`, `AIza`, JWT e `ghp_`, em
+todo o histórico de todas as branches. Achou ou o git falhou: saída 1, push
+bloqueado. **Dentro do sandbox do Claude o `%APPDATA%` é redirecionado e não tem
+as chaves**: lá, passar a cópia real como argumento
+(`open-flow-instalar/settings-real.json`). O fork no GitHub
+(`patrickbaltieri/open-flow`) também tem secret scanning e push protection ligados.
+
+---
+
+## 18. Sidecar local sem a `av`, com vocabulário e contra texto inventado
+
+**Onde:** `sidecar/stt_server.py`.
+
+O decodificador do faster-whisper abre o áudio pela `av`, e a `av` 19 recusa o
+`metadata_errors` que o faster-whisper 1.2.1 passa: o sidecar caía já no
+aquecimento com o venv do TOMO (`C:\PROJETOS\TOMO-whisper\venv`). Agora o WAV
+16-bit do app é lido com `wave` + numpy. A rota `/stt` aceita `prompt`
+(initial_prompt) e `beam`, e devolve `model` e `device` — a prova, gravada no
+ditado, de que a transcrição foi local. Contra alucinação em silêncio:
+`hallucination_silence_threshold=2.0` (com `word_timestamps`) e
+`condition_on_previous_text=False`; tirou o "E aí E aí..." do fim de um ditado e
+baixou de 8,1 s para 2,6 s os 54 s de áudio. Um "Obrigado." inventado nos 0,4 s
+finais continua possível: **decisão do Patrick, o fim do áudio não é cortado**.
+
+---
+
+## 19. Atalho misto em todos os atalhos de ditado
+
+**Onde:** `lib.rs` (`handle_key`, `SEGURAR`) e `platform/windows.rs`.
+
+Toque com menos de 0,6 s começa e outro toque do mesmo atalho termina; segurar
+grava até soltar (mesmo limiar do gravador do TOMO). Vale para os dois atalhos
+gerais e para o de cada perfil. A tecla comum do atalho (o F2 de Alt+F2) é
+engolida no hook e não chega ao app em foco; com Alt ou Win apertado é injetado
+um vkE8 para o modificador solto não abrir menu. A soltura só é engolida se a
+descida foi. Falha ao abrir o microfone é avisada à thread do hook
+(`falhou_ao_gravar`), sem dedução por tempo — microfone Bluetooth demora.
+**No macOS o hook não engole a tecla** (o retorno de `handle_key` é ignorado lá).
+
+---
+
+## 20. Perfil "Salvar para o laudo" e transcrição só local
+
+**Onde:** `ditados.rs`, campos `save_only`, `stt_local_only` e `stt_prompt` do
+`Profile`, aba Perfis.
+
+`stt_local_only`: só o sidecar, sem nuvem e sem fallback. `save_only` implica só
+local e grava cada ditado em `%APPDATA%\OpenFlow\ditados\<AAAA-MM-DD_HHMMSS>.wav`
+e `.json` (inicio, fim, profile, audio, audio_secs, raw, stt, stt_segundos,
+status, erro), escrito por `.tmp` + rename. Cola o texto cru fora do histórico
+do Win+V, não reescreve, não entra no `history.jsonl` nem na aba Áudios. O
+perfil é congelado no início da gravação. O TOMO busca a pasta no "áudio
+pronto" (`tomo/ditado.py`) e lê o paciente do TDO.ini ele mesmo. Retenção: a da
+aba Áudios (padrão agora 7 dias), nunca menos de 7. Com perfil assim, o sidecar
+sobe no boot. Configuração da máquina: `open-flow-instalar/configurar-laudo.py`.
+
+---
+
+## 21. Testes não gravam na pasta real
+
+**Onde:** `config_dir()` em `lib.rs`.
+
+O teste da troca de perfil chama `cycle_profile`, que grava o `settings.json`.
+Em teste, `config_dir()` aponta para a pasta temporária. **No app do Claude
+(MSIX) o `AppData\Roaming` das sessões é virtual** (`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming`): o que um teste grava ali esconde o arquivo real
+para as sessões, sem tocá-lo. Para ler o real, usar um terminal fora do sandbox.
+
+---
+
 ## Procedimento de merge
 
 1. `git fetch --tags origin` e ver o que mudou: `git log --oneline HEAD..origin/main`

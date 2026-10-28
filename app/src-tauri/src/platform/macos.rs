@@ -120,6 +120,8 @@ pub fn spawn_hotkey_listener(shared: Arc<Shared>, tx: Sender<Cmd>) {
             pressed: HashSet::new(),
             latched: None,
             recording: None,
+            started_at: None,
+            engolidas: HashSet::new(),
         });
         let own_pid = std::process::id() as i64;
         println!("[hotkey] instalando event tap global...");

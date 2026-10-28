@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,8 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 
+mod audios;
+mod ditados;
 mod insertion_queue;
 mod platform;
 mod siwc;
@@ -48,6 +50,17 @@ struct Profile {
     /// preenchido, e aí é obrigatório: o modelo global pertence a outro
     /// provedor e daria 404 sem explicar o motivo.
     rewrite_model: String,
+    /// Transcreve só neste computador (sidecar local), sem nuvem e sem cair
+    /// para a nuvem se o local falhar: ditado com dado de paciente, em que o
+    /// áudio não pode sair da máquina (regra do laudo do TOMO, LGPD).
+    stt_local_only: bool,
+    /// Vocabulário deste perfil para quem transcreve (initial_prompt do
+    /// Whisper). Vazio usa o dicionário global.
+    stt_prompt: String,
+    /// Não cola nem reescreve: o ditado vira `.wav` + `.json` com o texto cru
+    /// na pasta `ditados` (ver ditados.rs), para outro programa buscar. Também
+    /// fica fora do histórico e da pasta de áudios do app: é dado de paciente.
+    save_only: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]
@@ -161,6 +174,9 @@ struct Settings {
     dictionary: Vec<String>,
     snippets: Vec<Snippet>,
     history_enabled: bool,
+    /// dias que a cópia em disco de cada ditado fica guardada; 0 = não grava.
+    /// Vale também para a pasta `ditados` (ver `prazo_ditados`).
+    audio_keep_days: u32,
     python: String,
     sidecar: String,
     stt_port: u16,
@@ -248,6 +264,8 @@ impl Default for Settings {
             dictionary: Vec::new(),
             snippets: Vec::new(),
             history_enabled: true,
+            // 7 cobre fim de semana e feriado até o laudo buscar o ditado
+            audio_keep_days: 7,
             // ponytail: caminhos desta máquina; viram recurso empacotado na fase 3
             python,
             sidecar,
@@ -270,15 +288,31 @@ struct Shared {
     /// cada exibição do overlay ganha um número; quem termina tarde só mexe na
     /// janela se ainda for o dono dela (ditar de novo enquanto o anterior processa)
     overlay_gen: AtomicU64,
+    /// o último Start falhou ao abrir o microfone: o hook confere para não
+    /// ficar preso numa gravação que nunca começou. É aviso explícito da thread
+    /// de captura, não dedução por tempo — microfone Bluetooth leva mais de 1s
+    /// para abrir, e tratar isso como falha liberava outro atalho no meio.
+    falhou_ao_gravar: AtomicBool,
 }
 
 impl Settings {
+    /// algum perfil transcreve só no sidecar local
+    fn tem_perfil_local(&self) -> bool {
+        self.profiles.iter().any(|p| p.stt_local_only || p.save_only)
+    }
+
     fn groq_ready(&self) -> bool {
         self.groq_api_key.as_deref().map(|k| !k.is_empty()).unwrap_or(false)
     }
 }
 
 pub(crate) fn config_dir() -> std::path::PathBuf {
+    // Teste nunca toca a pasta real: o teste da troca de perfil chama
+    // `cycle_profile`, que grava o settings.json, e em 28/10/2026 isso apagou
+    // as configurações de verdade (perfis, chaves, atalhos) no meio do uso.
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("openflow-testes-{}", std::process::id()));
+    #[cfg(not(test))]
     dirs::config_dir().unwrap().join("OpenFlow")
 }
 
@@ -451,8 +485,10 @@ fn parse_hotkey(s: &str) -> Option<Vec<Vec<u32>>> {
 /// O que um atalho faz quando disparado.
 #[derive(Clone)]
 enum Act {
-    /// grava e dita; `profile` força o estilo daquele perfil sem mudar o perfil ativo
-    Record { toggle: bool, profile: Option<String> },
+    /// grava e dita; `profile` força o estilo daquele perfil sem mudar o perfil ativo.
+    /// Todo atalho de ditado é misto (`SEGURAR`): toque curto liga e outro toque
+    /// desliga; segurar grava até soltar.
+    Record { profile: Option<String> },
     /// avança para o próximo perfil da lista
     CycleProfile,
 }
@@ -478,15 +514,15 @@ fn add_binding(v: &mut Vec<Binding>, id: String, keys: &str, act: Act) {
 
 fn build_bindings(s: &Settings) -> Vec<Binding> {
     let mut v = Vec::new();
-    add_binding(&mut v, "hold".into(), &s.hotkey, Act::Record { toggle: false, profile: None });
-    add_binding(&mut v, "toggle".into(), &s.hotkey_toggle, Act::Record { toggle: true, profile: None });
+    add_binding(&mut v, "hold".into(), &s.hotkey, Act::Record { profile: None });
+    add_binding(&mut v, "toggle".into(), &s.hotkey_toggle, Act::Record { profile: None });
     add_binding(&mut v, "cycle".into(), &s.hotkey_cycle_profile, Act::CycleProfile);
     for p in &s.profiles {
         add_binding(
             &mut v,
             format!("profile:{}", p.name),
             &p.hotkey,
-            Act::Record { toggle: p.hotkey_mode == "toggle", profile: Some(p.name.clone()) },
+            Act::Record { profile: Some(p.name.clone()) },
         );
     }
     // mais teclas = mais específico. Sem isto, Ctrl+Win dispararia junto com Ctrl+Win+J.
@@ -824,7 +860,7 @@ fn transcribe_openai(
     Ok(v["text"].as_str().unwrap_or("").trim().to_string())
 }
 
-fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
+fn transcribe_groq(wav: Vec<u8>, s: &Settings, vocab: Option<&str>) -> Result<String, String> {
     let key = s.groq_api_key.clone().filter(|k| !k.is_empty()).ok_or("chave Groq ausente")?;
     let part = reqwest::blocking::multipart::Part::bytes(wav)
         .file_name("audio.wav")
@@ -837,8 +873,8 @@ fn transcribe_groq(wav: Vec<u8>, s: &Settings) -> Result<String, String> {
     if s.speech_lang != "auto" {
         form = form.text("language", s.speech_lang.clone());
     }
-    if let Some(v) = vocabulario(s) {
-        form = form.text("prompt", v);
+    if let Some(v) = vocab {
+        form = form.text("prompt", v.to_string());
     }
     let resp = cloud_client()
         .post("https://api.groq.com/openai/v1/audio/transcriptions")
@@ -886,12 +922,46 @@ fn strip_credit(text: &str) -> &str {
     t
 }
 
-fn run_stt(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, String> {
-    // os dois provedores rodam Whisper, então os dois assinam legenda
-    stt_provider(wav, shared, s).map(|t| strip_credit(&t).to_string())
+fn run_stt(wav: Vec<u8>, shared: &Shared, s: &Settings, prof: Option<&Profile>) -> Result<String, String> {
+    run_stt_com_origem(wav, shared, s, prof).map(|(t, _)| t)
 }
 
-fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, String> {
+/// Como `run_stt`, devolvendo também quem transcreveu. No caminho só local a
+/// origem vem da resposta do sidecar (modelo, dispositivo e tempo): é a prova,
+/// gravada no ditado do laudo, de que o áudio não saiu da máquina.
+fn run_stt_com_origem(
+    wav: Vec<u8>,
+    shared: &Shared,
+    s: &Settings,
+    prof: Option<&Profile>,
+) -> Result<(String, Option<Origem>), String> {
+    let vocab = prof
+        .map(|p| p.stt_prompt.trim())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| vocabulario(s));
+    // "salvar para o laudo" implica só local: é áudio de paciente
+    let texto = if prof.is_some_and(|p| p.stt_local_only || p.save_only) {
+        // sem nuvem e sem fallback: falhar aqui é melhor que mandar o áudio para fora.
+        // Beam 5, o mesmo do TOMO: no local a precisão custa ~1s, não dinheiro.
+        ensure_sidecar(shared, s)
+            .map_err(|e| format!("transcrição local indisponível ({e}); este perfil não usa a nuvem"))?;
+        transcribe_local(wav, s.stt_port, &s.speech_lang, vocab.as_deref(), 5).map(|(t, o)| (t, Some(o)))
+    } else {
+        stt_provider(wav, shared, s, vocab.as_deref()).map(|t| (t, None))
+    };
+    // os dois provedores rodam Whisper, então os dois assinam legenda
+    texto.map(|(t, o)| (strip_credit(&t).to_string(), o))
+}
+
+/// Quem transcreveu, segundo o próprio sidecar.
+struct Origem {
+    modelo: String,
+    dispositivo: String,
+    segundos: f64,
+}
+
+fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings, vocab: Option<&str>) -> Result<String, String> {
     // provedor escolhido na aba Provedores tem prioridade
     if !s.stt_provider_name.is_empty() {
         match s.providers.iter().find(|p| p.name == s.stt_provider_name) {
@@ -900,7 +970,7 @@ fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, S
                 p,
                 &s.stt_model,
                 &s.speech_lang,
-                vocabulario(s).as_deref(),
+                vocab,
             ) {
                 Ok(t) => {
                     println!("[stt] transcrito via {} ({})", p.name, s.stt_model);
@@ -914,7 +984,7 @@ fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, S
             ),
         }
     } else if s.stt_provider == "groq" && s.groq_ready() {
-        match transcribe_groq(wav.clone(), s) {
+        match transcribe_groq(wav.clone(), s, vocab) {
             Ok(t) => {
                 println!("[stt] transcrito via Groq (nuvem)");
                 return Ok(t);
@@ -923,28 +993,50 @@ fn stt_provider(wav: Vec<u8>, shared: &Shared, s: &Settings) -> Result<String, S
         }
     }
     match ensure_sidecar(shared, s) {
-        Ok(()) => transcribe(wav, s.stt_port, &s.speech_lang),
+        Ok(()) => transcribe(wav, s.stt_port, &s.speech_lang, vocab, 1),
         Err(e) if s.stt_provider == "local" && s.groq_ready() => {
             eprintln!("[stt] local indisponível ({e}); caindo para o Groq");
-            transcribe_groq(wav, s)
+            transcribe_groq(wav, s, vocab)
         }
         Err(e) => Err(e),
     }
 }
 
-fn transcribe(wav: Vec<u8>, port: u16, lang: &str) -> Result<String, String> {
+fn transcribe(wav: Vec<u8>, port: u16, lang: &str, vocab: Option<&str>, beam: u32) -> Result<String, String> {
+    transcribe_local(wav, port, lang, vocab, beam).map(|(t, _)| t)
+}
+
+fn transcribe_local(
+    wav: Vec<u8>,
+    port: u16,
+    lang: &str,
+    vocab: Option<&str>,
+    beam: u32,
+) -> Result<(String, Origem), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| e.to_string())?;
+    let beam = beam.to_string();
+    let mut q = vec![("lang", lang), ("beam", beam.as_str())];
+    if let Some(v) = vocab {
+        q.push(("prompt", v));
+    }
     let v: serde_json::Value = client
-        .post(format!("http://127.0.0.1:{port}/stt?lang={lang}"))
+        .post(format!("http://127.0.0.1:{port}/stt"))
+        .query(&q)
         .body(wav)
         .send()
         .map_err(|e| format!("sidecar STT: {e}"))?
         .json()
         .map_err(|e| e.to_string())?;
-    Ok(v["text"].as_str().unwrap_or("").trim().to_string())
+    let origem = Origem {
+        // sidecar antigo não manda os dois campos: fica registrado que não se sabe
+        modelo: v["model"].as_str().unwrap_or("?").to_string(),
+        dispositivo: v["device"].as_str().unwrap_or("?").to_string(),
+        segundos: v["stt_seconds"].as_f64().unwrap_or(-1.0),
+    };
+    Ok((v["text"].as_str().unwrap_or("").trim().to_string(), origem))
 }
 
 fn build_prompt(s: &Settings, profile: &str) -> String {
@@ -1383,13 +1475,13 @@ fn apply_snippets(text: &str, snippets: &[Snippet]) -> String {
     out
 }
 
-fn insert_text(text: &str) -> Result<(), String> {
+fn insert_text(text: &str, privado: bool) -> Result<(), String> {
     let mut clip = arboard::Clipboard::new().map_err(|e| {
         app_log("insert.log", &format!("clipboard indisponível: {e}"));
         e.to_string()
     })?;
     let backup = clip.get_text().ok();
-    clip.set_text(text).map_err(|e| {
+    copiar(&mut clip, text, privado).map_err(|e| {
         app_log("insert.log", &format!("set_text falhou: {e}"));
         e.to_string()
     })?;
@@ -1615,6 +1707,178 @@ enum Cmd {
     Start(Option<String>),
     Stop,
     Cancel,
+    /// transcreve de novo um áudio salvo e cola onde estiver o cursor
+    Retranscribe(std::path::PathBuf),
+}
+
+/// "Não guardar" (0) vale para a aba Áudios, não para os ditados do laudo:
+/// esses existem para outro programa buscar, e apagar tudo os perderia.
+fn prazo_ditados(audio_keep_days: u32) -> u32 {
+    if audio_keep_days == 0 { 7 } else { audio_keep_days }
+}
+
+/// Põe o texto na área de transferência. `privado` marca o conteúdo para não
+/// entrar no histórico do Win+V nem na nuvem (no macOS, no histórico dos
+/// gerenciadores de clipboard): é texto de paciente.
+fn copiar(clip: &mut arboard::Clipboard, texto: &str, privado: bool) -> Result<(), arboard::Error> {
+    if privado {
+        #[cfg(windows)]
+        {
+            use arboard::SetExtWindows;
+            // monitoring cobre histórico e nuvem; a doc do arboard pede um só
+            return clip.set().exclude_from_monitoring().text(texto);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use arboard::SetExtApple;
+            return clip.set().exclude_from_history().text(texto);
+        }
+    }
+    clip.set_text(texto)
+}
+
+/// Texto pronto para colar.
+struct Pronto {
+    texto: String,
+    /// motivo para o balão quando o texto saiu sem a correção esperada
+    aviso: Option<String>,
+    /// perfil do laudo: o ditado já está na pasta `ditados`; cola o cru fora
+    /// do histórico do clipboard e não guarda para a bandeja
+    salvo: bool,
+}
+
+type Resultado = Result<Pronto, String>;
+
+/// Reserva a posição do ditado na fila de colagem e processa em thread própria:
+/// a thread do atalho fica livre e o próximo Start é imediato.
+#[allow(clippy::too_many_arguments)]
+fn enfileirar(
+    shared: &Arc<Shared>,
+    app: &AppHandle,
+    insert_tx: &Sender<(u64, Receiver<Resultado>)>,
+    gen: u64,
+    wav: Vec<u8>,
+    secs: f32,
+    forced_profile: Option<String>,
+    snap: Option<Profile>,
+    arquivo: Option<std::path::PathBuf>,
+    ditado: Option<ditados::Ditado>,
+) {
+    // overlay segue no ar em "processando": soltar o atalho e ver a
+    // janela sumir por 2-3s é indistinguível de ter falhado
+    overlay_status(app, "processing", "");
+    let s = shared.settings.lock().unwrap().clone();
+    let profile = forced_profile.unwrap_or_else(|| s.active_profile.clone());
+    let shared_w = shared.clone();
+    // Reservar a posição na thread de captura, antes de processar:
+    // ordem de conclusão das APIs nunca decide a ordem da colagem.
+    let (result_tx, result_rx) = channel();
+    if insert_tx.send((gen, result_rx)).is_err() {
+        overlay_fail(app, gen, "Fila de inserção indisponível");
+        return;
+    }
+    std::thread::spawn(move || {
+        let result = match &ditado {
+            Some(d) => transcrever_ditado(wav, secs, &shared_w, &s, d, snap.as_ref()),
+            None => transcrever(wav, secs, &shared_w, &s, &profile, snap.as_ref()),
+        };
+        if let Some(a) = &arquivo {
+            match &result {
+                Ok(_) => audios::limpar_falha(a),
+                Err(e) => audios::marcar_falha(a, e),
+            }
+        }
+        let _ = result_tx.send(result);
+    });
+}
+
+/// STT, reescrita, snippets e histórico. Devolve o texto final e, se a
+/// reescrita falhou, o motivo para o balão.
+/// `snap` é o perfil como estava no início da gravação: trocar ou renomear o
+/// perfil no meio não pode mandar para a nuvem um ditado que começou só local.
+fn transcrever(
+    wav: Vec<u8>,
+    secs: f32,
+    shared: &Shared,
+    s: &Settings,
+    profile: &str,
+    snap: Option<&Profile>,
+) -> Resultado {
+    let t0 = Instant::now();
+    let prof = snap.or_else(|| s.profiles.iter().find(|p| p.name == profile));
+    let raw = run_stt(wav, shared, s, prof)?;
+    if raw.is_empty() {
+        return Err("transcrição vazia".into());
+    }
+    if is_hallucination(&raw, secs) {
+        return Err(format!("alucinação de silêncio descartada: {raw:?}"));
+    }
+    let t_stt = t0.elapsed().as_secs_f32();
+    // Reescrita que falha NÃO aborta o ditado: o texto bruto do
+    // Whisper ainda é útil. Mas falhar em silêncio já custou dias
+    // duas vezes — modelo descontinuado e modelo inexistente na
+    // conta — porque o único sintoma era "o texto saiu sem
+    // correção". O motivo vai para o balão depois da colagem.
+    let mut aviso: Option<String> = None;
+    let final_text = match rewrite(&raw, s, profile) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[pipeline] reescrita falhou ({e}); usando texto bruto");
+            aviso = Some(friendly_error(&e));
+            raw.clone()
+        }
+    };
+    let final_text = apply_snippets(&final_text, &s.snippets);
+    let total = t0.elapsed().as_secs_f32();
+    println!("[pipeline] áudio {secs:.1}s | stt {t_stt:.2}s | total {total:.2}s");
+    if s.history_enabled {
+        append_history(&HistoryEntry {
+            ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            profile: profile.to_string(),
+            raw,
+            r#final: final_text.clone(),
+            audio_secs: secs,
+            stt_secs: t_stt,
+            total_secs: total,
+        });
+    }
+    Ok(Pronto { texto: final_text, aviso, salvo: false })
+}
+
+/// Perfil "só salvar": STT e o `.json` na pasta `ditados`, sem reescrita, sem
+/// histórico e sem colar. A falha também vira `.json` (status "falhou"), para
+/// quem busca a pasta saber que aquele `.wav` não tem texto.
+fn transcrever_ditado(
+    wav: Vec<u8>,
+    secs: f32,
+    shared: &Shared,
+    s: &Settings,
+    d: &ditados::Ditado,
+    snap: Option<&Profile>,
+) -> Resultado {
+    // perfil sumiu no meio: o ditado nasceu "salvar para o laudo", então segue só local
+    let fallback = Profile { name: d.profile.clone(), save_only: true, ..Default::default() };
+    let prof = snap.or_else(|| s.profiles.iter().find(|p| p.name == d.profile)).unwrap_or(&fallback);
+    let mut stt = "sidecar local (sem resposta)".to_string();
+    let mut stt_secs = None;
+    let raw = run_stt_com_origem(wav, shared, s, Some(prof)).and_then(|(t, o)| {
+        if let Some(o) = o {
+            stt = format!("{} local {}", o.modelo, o.dispositivo);
+            stt_secs = Some(o.segundos);
+        }
+        if t.is_empty() {
+            Err("transcrição vazia".into())
+        } else if is_hallucination(&t, secs) {
+            Err(format!("alucinação de silêncio descartada: {t:?}"))
+        } else {
+            Ok(t)
+        }
+    });
+    let gravou = d.salvar_json(secs, &stt, stt_secs, raw.as_deref().map_err(String::as_str));
+    let raw = raw?;
+    gravou.map_err(|e| format!("transcreveu, mas o ditado não foi salvo: {e}"))?;
+    println!("[ditados] salvo ({secs:.1}s de áudio, {} caracteres)", raw.chars().count());
+    Ok(Pronto { texto: raw, aviso: None, salvo: true })
 }
 
 fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
@@ -1626,17 +1890,21 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
         insertion_queue::consume_in_order(insert_rx, |gen, result| {
             let result = result
                 .map_err(|_| "Processamento do ditado interrompido".to_string())
-                .and_then(|result: Result<(String, Option<String>), String>| result)
-                .and_then(|(text, aviso)| {
+                .and_then(|result: Resultado| result)
+                .and_then(|p: Pronto| {
+                    if p.salvo {
+                        // texto de paciente: colado fora do Win+V e não guardado para a bandeja
+                        return insert_text(&p.texto, true).map(|()| Some("ditado salvo para o laudo".to_string()));
+                    }
                     // Preservar a recuperação pela bandeja mesmo se a colagem falhar.
-                    *shared_insert.last_text.lock().unwrap() = text.clone();
-                    insert_text(&text).map(|()| aviso)
+                    *shared_insert.last_text.lock().unwrap() = p.texto.clone();
+                    insert_text(&p.texto, false).map(|()| p.aviso.map(|m| format!("texto sem correção — {m}")))
                 });
             match result {
                 // colou, mas sem reescrita: o texto é o bruto do Whisper
-                Ok(Some(motivo)) => {
+                Ok(Some(balao)) => {
                     overlay_hide(&app_insert, gen);
-                    toast_show(&app_insert, &format!("texto sem correção — {motivo}"));
+                    toast_show(&app_insert, &balao);
                 }
                 Ok(None) => overlay_hide(&app_insert, gen),
                 Err(e) => {
@@ -1650,11 +1918,31 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
         let mut rec = Recorder::new();
         // perfil pedido pelo atalho que iniciou a gravação em curso
         let mut pending_profile: Option<String> = None;
+        // perfil "só salvar": o nome do arquivo é a hora do início da gravação
+        let mut pending_ditado: Option<ditados::Ditado> = None;
+        // o perfil como estava no Start: é ele que decide nuvem ou local
+        let mut pending_snap: Option<Profile> = None;
         let mut gen = 0u64;
+        let mut gravando = false;
         loop {
             match rx.recv() {
                 Ok(Cmd::Start(profile)) => {
-                    pending_profile = profile;
+                    if gravando {
+                        eprintln!("[pipeline] Start com gravação em curso ignorado");
+                        continue;
+                    }
+                    shared.falhou_ao_gravar.store(false, Ordering::SeqCst);
+                    let (nome, snap) = {
+                        let g = shared.settings.lock().unwrap();
+                        let nome = profile.unwrap_or_else(|| g.active_profile.clone());
+                        let snap = g.profiles.iter().find(|p| p.name == nome).cloned();
+                        (nome, snap)
+                    };
+                    pending_ditado =
+                        snap.as_ref().is_some_and(|p| p.save_only).then(|| ditados::Ditado::novo(nome.clone()));
+                    pending_profile = Some(nome);
+                    pending_snap = snap;
+                    gravando = true;
                     gen = overlay_show(&app);
                     let mic = shared.settings.lock().unwrap().mic.clone();
                     let app_lvl = app.clone();
@@ -1666,6 +1954,8 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                         }
                     });
                     if let Err(e) = rec.start(mic.as_deref(), on_level) {
+                        gravando = false;
+                        shared.falhou_ao_gravar.store(true, Ordering::SeqCst);
                         eprintln!("[pipeline] gravação falhou: {e}");
                         overlay_fail(&app, gen, &e);
                     } else {
@@ -1673,6 +1963,9 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                     }
                 }
                 Ok(Cmd::Cancel) => {
+                    gravando = false;
+                    pending_ditado = None;
+                    pending_snap = None;
                     let _ = rec.stop();
                     overlay_hide(&app, gen);
                     println!("[pipeline] ditado cancelado");
@@ -1680,6 +1973,9 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                 Ok(Cmd::Stop) => {
                     // o overlay só sai depois da colagem: some antes = parece ter falhado
                     let forced_profile = pending_profile.take();
+                    let ditado = pending_ditado.take();
+                    let snap = pending_snap.take();
+                    gravando = false;
                     let (samples, rate) = rec.stop();
                     let secs = samples.len() as f32 / rate as f32;
                     if secs < 0.4 {
@@ -1693,64 +1989,50 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                         overlay_hide(&app, gen);
                         continue;
                     }
-                    // overlay segue no ar em "processando": soltar o atalho e ver a
-                    // janela sumir por 2-3s é indistinguível de ter falhado
-                    overlay_status(&app, "processing", "");
-                    // processamento em thread própria: a thread do atalho fica livre e o
-                    // próximo Start é imediato (overlay e gravação sem atraso de fila)
-                    let s = shared.settings.lock().unwrap().clone();
-                    let profile = forced_profile.unwrap_or_else(|| s.active_profile.clone());
-                    let shared_w = shared.clone();
-                    // Reservar a posição na thread de captura, antes de processar:
-                    // ordem de conclusão das APIs nunca decide a ordem da colagem.
-                    let (result_tx, result_rx) = channel();
-                    if insert_tx.send((gen, result_rx)).is_err() {
-                        overlay_fail(&app, gen, "Fila de inserção indisponível");
+                    let wav = wav_bytes(&samples, rate);
+                    // cópia em disco ANTES do STT: se ele falhar, a fala ainda existe
+                    // e o menu do ícone ou a aba Áudios transcrevem de novo
+                    // "Salvar histórico localmente" desligado vale para o áudio também
+                    if let Some(d) = &ditado {
+                        if let Err(e) = d.salvar_wav(&wav) {
+                            eprintln!("[ditados] áudio não foi salvo: {e}");
+                            toast_show(&app, &format!("áudio do laudo não foi salvo — {e}"));
+                        }
+                    }
+                    // o ditado do laudo já tem a cópia dele na pasta `ditados`, e o
+                    // de perfil só local não pode ficar onde a aba Áudios o
+                    // retranscreveria pela nuvem
+                    let sensivel = snap.as_ref().is_some_and(|p| p.stt_local_only || p.save_only);
+                    let guardar = ditado.is_none() && !sensivel && {
+                        let g = shared.settings.lock().unwrap();
+                        g.history_enabled && g.audio_keep_days > 0
+                    };
+                    let arquivo = if guardar {
+                        audios::salvar(&wav)
+                            .map_err(|e| {
+                                eprintln!("[pipeline] áudio não foi salvo: {e}");
+                                toast_show(&app, &format!("áudio não foi guardado — {e}"));
+                            })
+                            .ok()
+                    } else {
+                        None
+                    };
+                    enfileirar(&shared, &app, &insert_tx, gen, wav, secs, forced_profile, snap, arquivo, ditado);
+                }
+                Ok(Cmd::Retranscribe(arquivo)) => {
+                    // durante uma gravação o overlay é dela: trocar o dono aqui
+                    // deixaria o ditado em curso sem conseguir fechar a janela
+                    if gravando {
+                        toast_show(&app, "termine a gravação antes de transcrever o último áudio");
                         continue;
                     }
-                    std::thread::spawn(move || {
-                        let t0 = Instant::now();
-                        let result = run_stt(wav_bytes(&samples, rate), &shared_w, &s)
-                            .and_then(|raw| {
-                                if raw.is_empty() {
-                                    return Err("transcrição vazia".into());
-                                }
-                                if is_hallucination(&raw, secs) {
-                                    return Err(format!("alucinação de silêncio descartada: {raw:?}"));
-                                }
-                                let t_stt = t0.elapsed().as_secs_f32();
-                                // Reescrita que falha NÃO aborta o ditado: o texto bruto do
-                                // Whisper ainda é útil. Mas falhar em silêncio já custou dias
-                                // duas vezes — modelo descontinuado e modelo inexistente na
-                                // conta — porque o único sintoma era "o texto saiu sem
-                                // correção". O motivo vai para o balão depois da colagem.
-                                let mut aviso: Option<String> = None;
-                                let final_text = match rewrite(&raw, &s, &profile) {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        eprintln!("[pipeline] reescrita falhou ({e}); usando texto bruto");
-                                        aviso = Some(friendly_error(&e));
-                                        raw.clone()
-                                    }
-                                };
-                                let final_text = apply_snippets(&final_text, &s.snippets);
-                                let total = t0.elapsed().as_secs_f32();
-                                println!("[pipeline] áudio {secs:.1}s | stt {t_stt:.2}s | total {total:.2}s");
-                                if s.history_enabled {
-                                    append_history(&HistoryEntry {
-                                        ts: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                                        profile: profile.clone(),
-                                        raw,
-                                        r#final: final_text.clone(),
-                                        audio_secs: secs,
-                                        stt_secs: t_stt,
-                                        total_secs: total,
-                                    });
-                                }
-                                Ok((final_text, aviso))
-                            });
-                        let _ = result_tx.send(result);
-                    });
+                    gen = overlay_show(&app);
+                    match audios::carregar(&arquivo) {
+                        Ok((wav, secs)) => {
+                            enfileirar(&shared, &app, &insert_tx, gen, wav, secs, None, None, Some(arquivo), None)
+                        }
+                        Err(e) => overlay_fail(&app, gen, &e),
+                    }
                 }
                 Err(_) => break,
             }
@@ -1769,13 +2051,49 @@ struct HookState {
     latched: Option<String>,
     /// atalho que iniciou a gravação em curso (só ele pode encerrá-la)
     recording: Option<String>,
+    /// quando o atalho que iniciou a gravação foi apertado: decide, ao soltar,
+    /// se foi toque (segue gravando) ou segurar (para)
+    started_at: Option<Instant>,
+    /// teclas cuja descida foi engolida: só a soltura delas é engolida também,
+    /// senão o app em foco ficaria com a tecla presa (F2 antes do Alt)
+    engolidas: HashSet<u32>,
 }
+
+/// Limiar do atalho misto, o mesmo do gravador do TOMO (`SEGURAR` em
+/// tomo/gravar.py): soltar antes disso é toque e a gravação continua até o
+/// próximo toque; soltar depois é segurar e a gravação para ali.
+const SEGURAR: Duration = Duration::from_millis(600);
 
 fn binding_satisfied(b: &Binding, pressed: &HashSet<u32>) -> bool {
     !b.groups.is_empty() && b.groups.iter().all(|g| g.iter().any(|k| pressed.contains(k)))
 }
 
-fn handle_key(st: &mut HookState, vk: u32, down: bool) {
+/// Processa uma tecla física. Devolve `true` quando ela é a tecla comum (não
+/// modificador) de um atalho disparado e deve ser engolida: sem isso o F2 de
+/// Alt+F2 chegaria também ao app em foco. A soltura só é engolida se a descida
+/// foi: descida que passou e soltura engolida deixariam a tecla presa no app.
+fn handle_key(st: &mut HookState, vk: u32, down: bool) -> bool {
+    // repetição automática segue o que foi decidido na primeira descida: se ela
+    // chegou ao app, as repetições e a soltura também chegam
+    let repeticao = down && st.pressed.contains(&vk);
+    processar_tecla(st, vk, down);
+    if repeticao {
+        return st.engolidas.contains(&vk);
+    }
+    if !down {
+        return st.engolidas.remove(&vk);
+    }
+    let engolir = tecla_comum_do_atalho(st, vk);
+    if engolir {
+        st.engolidas.insert(vk);
+    } else {
+        // soltura perdida antes (UAC, tela de bloqueio): não engolir a próxima
+        st.engolidas.remove(&vk);
+    }
+    engolir
+}
+
+fn processar_tecla(st: &mut HookState, vk: u32, down: bool) {
     if down {
         st.pressed.insert(vk);
     } else {
@@ -1787,14 +2105,15 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
     // não acha mais a gravação e não dispara Stop.
     if down && st.recording.is_some() && *st.shared.cancel.lock().unwrap() == Some(vk) {
         st.recording = None;
+        st.started_at = None;
         let _ = st.tx.send(Cmd::Cancel);
         return;
     }
 
     enum Step {
         Nothing,
-        /// o atalho pressionado foi solto; `hold` diz se isso encerra a gravação
-        Release { hold: bool },
+        /// o atalho pressionado foi solto
+        Release,
         Fire { id: String, act: Act },
     }
 
@@ -1805,11 +2124,12 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
         match &st.latched {
             Some(id) => match bindings.iter().find(|b| &b.id == id) {
                 Some(b) if binding_satisfied(b, &st.pressed) => Step::Nothing,
-                Some(b) => Step::Release {
-                    hold: matches!(b.act, Act::Record { toggle: false, .. }),
-                },
+                Some(_) => Step::Release,
                 // o atalho sumiu (configuração mudou no meio): encerra o que estiver aberto
-                None => Step::Release { hold: true },
+                None => {
+                    st.started_at = Some(Instant::now() - SEGURAR);
+                    Step::Release
+                }
             },
             // a lista vem do mais específico para o mais genérico
             None => match bindings.iter().find(|b| binding_satisfied(b, &st.pressed)) {
@@ -1821,10 +2141,13 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
 
     match step {
         Step::Nothing => {}
-        Step::Release { hold } => {
+        Step::Release => {
             let id = st.latched.take();
-            if hold && st.recording == id {
+            // toque curto: a gravação segue até o próximo toque do mesmo atalho
+            let segurou = st.started_at.is_some_and(|t| t.elapsed() >= SEGURAR);
+            if segurou && id.is_some() && st.recording == id {
                 st.recording = None;
+                st.started_at = None;
                 let _ = st.tx.send(Cmd::Stop);
             }
         }
@@ -1837,11 +2160,18 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
                     let shared = st.shared.clone();
                     std::thread::spawn(move || cycle_profile(&shared));
                 }
-                Act::Record { toggle, profile } => {
+                Act::Record { profile } => {
+                    // a gravação não chegou a começar (microfone falhou): sem isto
+                    // o próximo toque viraria um Stop mudo em vez de um Start
+                    if st.recording.is_some() && st.shared.falhou_ao_gravar.swap(false, Ordering::SeqCst) {
+                        st.recording = None;
+                        st.started_at = None;
+                    }
                     if st.recording.is_some() {
-                        // gravando: só o mesmo atalho, em modo apertar/parar, encerra
-                        if st.recording.as_deref() == Some(id.as_str()) && toggle {
+                        // gravando (depois de um toque): só o mesmo atalho encerra
+                        if st.recording.as_deref() == Some(id.as_str()) {
                             st.recording = None;
+                            st.started_at = None;
                             let _ = st.tx.send(Cmd::Stop);
                         }
                         return;
@@ -1852,11 +2182,26 @@ fn handle_key(st: &mut HookState, vk: u32, down: bool) {
                         std::thread::spawn(move || toast_show(&app, &p));
                     }
                     st.recording = Some(id);
+                    st.started_at = Some(Instant::now());
+                    // o aviso de falha passa a valer só para este Start
+                    st.shared.falhou_ao_gravar.store(false, Ordering::SeqCst);
                     let _ = st.tx.send(Cmd::Start(profile));
                 }
             }
         }
     }
+}
+
+/// A tecla faz parte do atalho travado agora e não é modificador? Modificador
+/// vem de `modifier_group` com as variantes esquerda e direita (grupo com mais
+/// de uma tecla); tecla comum é grupo de uma só.
+fn tecla_comum_do_atalho(st: &HookState, vk: u32) -> bool {
+    let Some(id) = &st.latched else { return false };
+    let bindings = st.shared.bindings.lock().unwrap();
+    bindings
+        .iter()
+        .find(|b| &b.id == id)
+        .is_some_and(|b| b.groups.iter().any(|g| g.len() == 1 && g[0] == vk))
 }
 
 #[tauri::command]
@@ -1888,9 +2233,14 @@ fn save_settings(
     settings: Settings,
 ) -> Result<(), String> {
     persist_settings(&settings)?;
+    // prazo menor (ou "não guardar") vale na hora, sem esperar o ciclo de 6h
+    if settings.audio_keep_days != state.settings.lock().unwrap().audio_keep_days {
+        audios::limpar_antigos(settings.audio_keep_days);
+        ditados::limpar_antigos(prazo_ditados(settings.audio_keep_days));
+    }
     *state.bindings.lock().unwrap() = build_bindings(&settings);
     *state.cancel.lock().unwrap() = parse_cancel_key(&settings.cancel_key);
-    let warm_local = settings.stt_provider == "local";
+    let warm_local = settings.stt_provider == "local" || settings.tem_perfil_local();
     rebuild_tray_menu(&app, &settings);
     *state.settings.lock().unwrap() = settings;
     if warm_local {
@@ -2156,6 +2506,61 @@ fn get_history(query: Option<String>, limit: Option<usize>) -> Vec<HistoryEntry>
 }
 
 #[tauri::command]
+fn list_audios() -> Vec<audios::Audio> {
+    audios::listar()
+}
+
+/// bytes crus do WAV para o player da aba Áudios (sem base64 no meio)
+#[tauri::command]
+fn read_audio(name: String) -> Result<tauri::ipc::Response, String> {
+    let p = audios::caminho(&name).ok_or("nome de áudio inválido")?;
+    std::fs::read(p).map(tauri::ipc::Response::new).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct Retranscricao {
+    texto: String,
+    /// motivo, quando a reescrita falhou e o texto é o bruto do STT
+    aviso: Option<String>,
+}
+
+/// Retranscreve um áudio escolhido na aba Áudios. O texto vai só para o
+/// clipboard: nessa hora o cursor está nesta janela, não onde se quer colar.
+#[tauri::command(async)]
+fn transcribe_audio(state: tauri::State<'_, Arc<Shared>>, name: String) -> Result<Retranscricao, String> {
+    let p = audios::caminho(&name).ok_or("nome de áudio inválido")?;
+    let (wav, secs) = audios::carregar(&p)?;
+    let s = state.settings.lock().unwrap().clone();
+    let result = transcrever(wav, secs, &state, &s, &s.active_profile, None);
+    match &result {
+        Ok(_) => audios::limpar_falha(&p),
+        Err(e) => audios::marcar_falha(&p, e),
+    }
+    let Pronto { texto, aviso, .. } = result.map_err(|e| friendly_error(&e))?;
+    *state.last_text.lock().unwrap() = texto.clone();
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(texto.clone()))
+        .map_err(|e| format!("transcreveu, mas o clipboard falhou: {e}"))?;
+    Ok(Retranscricao { texto, aviso })
+}
+
+#[tauri::command]
+fn open_ditados_dir(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let d = ditados::dir();
+    std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    app.opener().open_path(d.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn open_audio_dir(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let d = audios::dir();
+    std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
+    app.opener().open_path(d.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 fn clear_history() -> Result<(), String> {
     match std::fs::remove_file(history_path()) {
         Ok(()) => Ok(()),
@@ -2284,9 +2689,11 @@ fn build_tray_menu(app: &AppHandle, s: &Settings) -> tauri::Result<Menu<tauri::W
 
     let copy_last =
         MenuItem::with_id(app, "copy_last", "Copiar último ditado", true, None::<&str>)?;
+    let transcribe_last =
+        MenuItem::with_id(app, "transcribe_last", "Transcrever último áudio", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "Configurações", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Sair", true, None::<&str>)?;
-    Menu::with_items(app, &[&perfil, &pt_en, &idioma, &copy_last, &show, &quit])
+    Menu::with_items(app, &[&perfil, &pt_en, &idioma, &copy_last, &transcribe_last, &show, &quit])
 }
 
 /// altera as configurações no estado, grava em disco e avisa tray e janela
@@ -2386,9 +2793,18 @@ mod tests {
             app: OnceLock::new(),
             last_text: Mutex::new(String::new()),
             overlay_gen: AtomicU64::new(0),
+            falhou_ao_gravar: AtomicBool::new(false),
         });
         let (tx, rx) = channel::<Cmd>();
-        (HookState { shared, tx, pressed: HashSet::new(), latched: None, recording: None }, rx)
+        (HookState {
+            shared,
+            tx,
+            pressed: HashSet::new(),
+            latched: None,
+            recording: None,
+            started_at: None,
+            engolidas: HashSet::new(),
+        }, rx)
     }
 
     fn key(name: &str) -> u32 {
@@ -2464,7 +2880,115 @@ mod tests {
         handle_key(&mut st, key("SPACE"), true);
         assert!(rx.try_recv().is_err());
 
+        segurou(&mut st);
         handle_key(&mut st, win, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
+    }
+
+    /// simula que o atalho foi segurado além do limiar do modo misto
+    fn segurou(st: &mut HookState) {
+        st.started_at = Some(Instant::now() - SEGURAR - Duration::from_millis(1));
+    }
+
+    #[test]
+    fn toque_curto_liga_e_outro_toque_desliga() {
+        let (mut st, rx) = hook_com(|s| s.hotkey = "Alt+F2".into());
+        let (alt, f2) = (modkey("ALT"), key("F2"));
+
+        handle_key(&mut st, alt, true);
+        handle_key(&mut st, f2, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))));
+        handle_key(&mut st, f2, false);
+        handle_key(&mut st, alt, false);
+        assert!(rx.try_recv().is_err(), "toque curto não pode parar a gravação");
+
+        handle_key(&mut st, alt, true);
+        handle_key(&mut st, f2, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)), "segundo toque tem que parar");
+        handle_key(&mut st, f2, false);
+        handle_key(&mut st, alt, false);
+        assert!(rx.try_recv().is_err(), "soltar depois do segundo toque não pode reabrir nada");
+
+        // e o próximo ditado começa normalmente
+        handle_key(&mut st, alt, true);
+        handle_key(&mut st, f2, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))));
+    }
+
+    #[test]
+    fn segurar_grava_ate_soltar_em_qualquer_atalho() {
+        // o atalho "toggle" e o de perfil também são mistos
+        let (mut st, rx) = hook_com(|s| {
+            s.hotkey = String::new();
+            s.hotkey_toggle = "Alt+F2".into();
+            s.profiles[1].hotkey = "Ctrl+Alt+J".into();
+        });
+        handle_key(&mut st, modkey("ALT"), true);
+        handle_key(&mut st, key("F2"), true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))));
+        segurou(&mut st);
+        handle_key(&mut st, key("F2"), false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
+        handle_key(&mut st, modkey("ALT"), false);
+
+        handle_key(&mut st, modkey("CTRL"), true);
+        handle_key(&mut st, modkey("ALT"), true);
+        handle_key(&mut st, key("J"), true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(Some(_)))));
+        segurou(&mut st);
+        handle_key(&mut st, key("J"), false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
+    }
+
+    #[test]
+    fn so_a_tecla_comum_do_atalho_e_engolida() {
+        let (mut st, _rx) = hook_com(|s| s.hotkey = "Alt+F2".into());
+        let (alt, f2) = (modkey("ALT"), key("F2"));
+        assert!(!handle_key(&mut st, alt, true), "modificador sozinho chega ao app");
+        assert!(handle_key(&mut st, f2, true), "F2 do atalho não pode chegar ao app");
+        assert!(handle_key(&mut st, f2, true), "repetição automática também é engolida");
+        assert!(handle_key(&mut st, f2, false), "soltar o F2 também é engolido");
+        assert!(!handle_key(&mut st, alt, false));
+        // F2 sem o Alt não é o atalho: passa
+        assert!(!handle_key(&mut st, f2, true));
+        assert!(!handle_key(&mut st, f2, false));
+    }
+
+    #[test]
+    fn soltura_so_e_engolida_se_a_descida_foi() {
+        // F2 apertado antes do Alt: a descida chegou ao app, então a soltura também
+        // tem que chegar, senão o F2 fica preso lá
+        let (mut st, rx) = hook_com(|s| s.hotkey = "Alt+F2".into());
+        let (alt, f2) = (modkey("ALT"), key("F2"));
+        assert!(!handle_key(&mut st, f2, true));
+        assert!(!handle_key(&mut st, alt, true));
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))), "a combinação disparou");
+        assert!(!handle_key(&mut st, f2, true), "repetição de descida não engolida também passa");
+        assert!(!handle_key(&mut st, f2, false), "soltura de descida não engolida passa");
+    }
+
+    #[test]
+    fn gravacao_que_nao_comecou_nao_trava_o_atalho() {
+        // o microfone falhou: a thread de captura não está gravando, e o próximo
+        // toque tem que começar de novo em vez de virar um Stop mudo
+        let (mut st, rx) = hook_com(|s| s.hotkey = "Alt+F2".into());
+        let (alt, f2) = (modkey("ALT"), key("F2"));
+        handle_key(&mut st, alt, true);
+        handle_key(&mut st, f2, true);
+        handle_key(&mut st, f2, false);
+        handle_key(&mut st, alt, false);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))));
+        st.shared.falhou_ao_gravar.store(true, Ordering::SeqCst);
+        handle_key(&mut st, alt, true);
+        handle_key(&mut st, f2, true);
+        assert!(matches!(rx.try_recv(), Ok(Cmd::Start(None))), "esperava novo Start, não Stop");
+
+        // microfone lento mas sem falha: o segundo toque para, por mais tempo que passe
+        handle_key(&mut st, f2, false);
+        handle_key(&mut st, alt, false);
+        st.started_at = Some(Instant::now() - Duration::from_secs(5));
+        handle_key(&mut st, alt, true);
+        handle_key(&mut st, f2, true);
         assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
     }
 
@@ -2480,9 +3004,18 @@ mod tests {
             app: OnceLock::new(),
             last_text: Mutex::new(String::new()),
             overlay_gen: AtomicU64::new(0),
+            falhou_ao_gravar: AtomicBool::new(false),
         });
         let (tx, rx) = channel::<Cmd>();
-        (HookState { shared, tx, pressed: HashSet::new(), latched: None, recording: None }, rx)
+        (HookState {
+            shared,
+            tx,
+            pressed: HashSet::new(),
+            latched: None,
+            recording: None,
+            started_at: None,
+            engolidas: HashSet::new(),
+        }, rx)
     }
 
     #[test]
@@ -2504,6 +3037,7 @@ mod tests {
         // o perfil ativo não pode ter mudado
         assert_eq!(st.shared.settings.lock().unwrap().active_profile, "Bruto corrigido");
 
+        segurou(&mut st);
         handle_key(&mut st, key("J"), false);
         assert!(matches!(rx.try_recv(), Ok(Cmd::Stop)));
     }
@@ -2572,7 +3106,7 @@ mod tests {
         assert!(s.hotkey.is_empty());
         let b = build_bindings(&s);
         assert_eq!(b.len(), 1);
-        assert!(matches!(b[0].act, Act::Record { toggle: true, profile: None }));
+        assert!(matches!(b[0].act, Act::Record { profile: None }));
     }
 
     /// Trava o comportamento contra merge com o upstream: se alguém remover a
@@ -2972,8 +3506,10 @@ pub fn run() {
     let (settings, first_run) = load_settings();
     // migra chaves em texto plano para DPAPI na primeira oportunidade
     let _ = persist_settings(&settings);
-    // com Groq configurado como provedor, a GPU fica livre: o local só aquece sob demanda
-    let start_local = settings.stt_provider != "groq" || !settings.groq_ready();
+    // com Groq configurado como provedor, a GPU fica livre: o local só aquece sob
+    // demanda — a não ser que um perfil dite só local (laudo), que não pode
+    // esperar os ~30s de carga no primeiro ditado
+    let start_local = settings.stt_provider != "groq" || !settings.groq_ready() || settings.tem_perfil_local();
     let shared = Arc::new(Shared {
         bindings: Mutex::new(build_bindings(&settings)),
         cancel: Mutex::new(parse_cancel_key(&settings.cancel_key)),
@@ -2982,6 +3518,7 @@ pub fn run() {
         app: OnceLock::new(),
         last_text: Mutex::new(String::new()),
         overlay_gen: AtomicU64::new(0),
+            falhou_ao_gravar: AtomicBool::new(false),
     });
 
     let shared_exit = shared.clone();
@@ -3011,6 +3548,11 @@ pub fn run() {
             list_mics,
             get_history,
             clear_history,
+            list_audios,
+            read_audio,
+            transcribe_audio,
+            open_audio_dir,
+            open_ditados_dir,
             get_diagnostics,
             get_autostart,
             set_autostart,
@@ -3055,7 +3597,27 @@ pub fn run() {
             // o hook de teclado troca perfil e mostra o balão: precisa do handle
             let _ = shared_setup.app.set(app.handle().clone());
             let tx = spawn_pipeline(shared_setup.clone(), app.handle().clone());
+            let tx_tray = tx.clone();
             platform::spawn_hotkey_listener(shared_setup.clone(), tx);
+
+            // áudios guardados vencem em `audio_keep_days`: limpa no boot e a cada 6h,
+            // porque o app passa dias aberto na bandeja sem reiniciar
+            let shared_limpeza = shared_setup.clone();
+            std::thread::spawn(move || loop {
+                let (keep, keep_d) = {
+                    let g = shared_limpeza.settings.lock().unwrap();
+                    (g.audio_keep_days, prazo_ditados(g.audio_keep_days))
+                };
+                let n = audios::limpar_antigos(keep);
+                if n > 0 {
+                    println!("[audios] {n} arquivo(s) com mais de {keep} dias apagados");
+                }
+                let n = ditados::limpar_antigos(keep_d);
+                if n > 0 {
+                    println!("[ditados] {n} arquivo(s) com mais de {keep_d} dias apagados");
+                }
+                std::thread::sleep(Duration::from_secs(6 * 3600));
+            });
 
             if let Some(o) = app.get_webview_window("overlay") {
                 let _ = o.set_ignore_cursor_events(true);
@@ -3130,6 +3692,14 @@ pub fn run() {
                                 }
                             }
                         }
+                        // mesmo fluxo de um ditado: overlay em "processando", o usuário
+                        // clica onde quer o texto e ele cola ali quando terminar
+                        "transcribe_last" => match audios::mais_recente() {
+                            Some(p) => {
+                                let _ = tx_tray.send(Cmd::Retranscribe(p));
+                            }
+                            None => toast_show(app, "nenhum áudio salvo"),
+                        },
                         "show" => {
                             if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.show();

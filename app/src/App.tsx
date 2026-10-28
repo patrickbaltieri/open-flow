@@ -18,6 +18,12 @@ export interface Profile {
   /// provedor de reescrita só deste perfil; vazio usa o global
   rewrite_provider_name: string;
   rewrite_model: string;
+  /// transcreve só no sidecar local, sem nuvem nem fallback
+  stt_local_only: boolean;
+  /// vocabulário deste perfil para quem transcreve; vazio usa o dicionário
+  stt_prompt: string;
+  /// não cola: grava .wav + .json na pasta de ditados para outro programa
+  save_only: boolean;
 }
 
 export interface Snippet {
@@ -106,6 +112,7 @@ export interface Settings {
   dictionary: string[];
   snippets: Snippet[];
   history_enabled: boolean;
+  audio_keep_days: number;
   python: string;
   sidecar: string;
   stt_port: number;
@@ -121,6 +128,18 @@ interface HistoryEntry {
   total_secs: number;
 }
 
+interface AudioEntry {
+  name: string;
+  ts: number;
+  secs: number;
+  erro: string | null;
+}
+
+interface Retranscricao {
+  texto: string;
+  aviso: string | null;
+}
+
 interface Diagnostics {
   stt_provider: string;
   groq_key_set: boolean;
@@ -133,7 +152,7 @@ interface Diagnostics {
   recent: HistoryEntry[];
 }
 
-const TABS = ["Geral", "Provedores", "Insights", "Perfis", "Dicionário", "Snippets", "Histórico", "Diagnóstico", "Apoie"] as const;
+const TABS = ["Geral", "Provedores", "Insights", "Perfis", "Dicionário", "Snippets", "Histórico", "Áudios", "Diagnóstico", "Apoie"] as const;
 type Tab = (typeof TABS)[number];
 
 function App() {
@@ -226,6 +245,7 @@ function SettingsApp() {
         {tab === "Dicionário" && <DictTab s={settings} patch={patch} />}
         {tab === "Snippets" && <SnippetsTab s={settings} patch={patch} />}
         {tab === "Histórico" && <HistoryTab s={settings} patch={patch} />}
+        {tab === "Áudios" && <AudiosTab s={settings} patch={patch} />}
         {tab === "Diagnóstico" && <DiagTab />}
         {tab === "Apoie" && <ApoieTab />}
       </main>
@@ -403,17 +423,20 @@ function GeneralTab({ s, patch }: TabProps) {
     <section>
       <h1>Geral</h1>
       <label className="field">
-        <span>Atalho de ditado — segurar e falar</span>
+        <span>Atalho de ditado</span>
         <HotkeyInput value={s.hotkey} onChange={(v) => patch({ hotkey: v })} />
-        <small>Grava enquanto a combinação estiver pressionada e transcreve ao soltar.</small>
+        <small>
+          Dois jeitos no mesmo atalho: um toque rápido começa a gravar e outro toque termina; segurar
+          grava enquanto estiver apertado e transcreve ao soltar. Vale também para o atalho de cada perfil.
+        </small>
       </label>
 
       <label className="field">
-        <span>Atalho de ditado — apertar para iniciar e parar</span>
+        <span>Segundo atalho de ditado (opcional)</span>
         <HotkeyInput value={s.hotkey_toggle} onChange={(v) => patch({ hotkey_toggle: v })} />
         <small>
-          Para ditados longos: aperta uma vez para começar, aperta de novo para encerrar. Os dois
-          atalhos funcionam ao mesmo tempo — deixe em branco o que não quiser usar.
+          Outra combinação para o mesmo ditado, com o mesmo funcionamento. Deixe em branco se não
+          precisar; repetir aqui o atalho de cima não muda nada.
         </small>
       </label>
 
@@ -1105,14 +1128,52 @@ function ProfilesTab({ s, patch }: TabProps) {
           <div className="profile-hotkey">
             <span>Atalho próprio</span>
             <HotkeyInput value={p.hotkey} onChange={(v) => update(i, { hotkey: v })} />
-            <select
-              value={p.hotkey_mode === "toggle" ? "toggle" : "hold"}
-              onChange={(e) => update(i, { hotkey_mode: e.target.value })}
-            >
-              <option value="hold">segurar e falar</option>
-              <option value="toggle">apertar para iniciar/parar</option>
-            </select>
           </div>
+          <details className="profile-rewrite">
+            <summary>
+              Transcrição e destino:{" "}
+              {[(p.stt_local_only || p.save_only) && "só local", p.save_only && "salva para o laudo"]
+                .filter(Boolean)
+                .join(", ") || "como o resto do app"}
+            </summary>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={!!p.stt_local_only || !!p.save_only}
+                disabled={!!p.save_only}
+                onChange={(e) => update(i, { stt_local_only: e.target.checked })}
+              />
+              Transcrever só neste computador (o áudio não vai para a nuvem; a reescrita segue o provedor do perfil)
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={!!p.save_only}
+                onChange={(e) =>
+                  // laudo é dado de paciente: ligar o laudo liga o "só local" junto
+                  update(i, e.target.checked ? { save_only: true, stt_local_only: true } : { save_only: false })
+                }
+              />
+              Salvar para o laudo: pasta de ditados, texto cru, sem reescrita
+            </label>
+            <textarea
+              rows={2}
+              value={p.stt_prompt ?? ""}
+              placeholder="Vocabulário para a transcrição deste perfil (termos que o Whisper deve reconhecer). Vazio usa o dicionário."
+              onChange={(e) => update(i, { stt_prompt: e.target.value })}
+            />
+            {p.save_only && (
+              <div className="history-controls">
+                <button onClick={() => invoke("open_ditados_dir")}>Abrir pasta de ditados</button>
+              </div>
+            )}
+            <p className="hint">
+              "Salvar para o laudo" grava cada ditado como .wav e .json (texto cru) na pasta de ditados, para
+              outro programa buscar — é o caminho do laudo do TOMO. O texto cru também é colado, fora do
+              histórico do Win+V, e não entra no histórico do app nem na aba Áudios. Fica pelo prazo da aba
+              Áudios, mesmo com o histórico desligado (com "Não guardar" lá, fica 7 dias).
+            </p>
+          </details>
           <details className="profile-rewrite">
             <summary>
               Reescrita:{" "}
@@ -1139,7 +1200,8 @@ function ProfilesTab({ s, patch }: TabProps) {
       ))}
       <p className="hint">
         O atalho próprio dita direto no estilo daquele perfil, sem trocar o perfil ativo. Clique
-        no campo e tecle a combinação; comece pelos modificadores. Em <b>Reescrita</b>, cada
+        no campo e tecle a combinação; comece pelos modificadores. Todo atalho de ditado é misto:
+        um toque rápido começa e outro toque termina; segurar grava até soltar. Em <b>Reescrita</b>, cada
         perfil pode usar um provedor diferente do resto do app.
       </p>
       <button
@@ -1154,6 +1216,9 @@ function ProfilesTab({ s, patch }: TabProps) {
                 hotkey_mode: "hold",
                 rewrite_provider_name: "",
                 rewrite_model: "",
+                stt_local_only: false,
+                stt_prompt: "",
+                save_only: false,
               },
             ],
           })
@@ -1293,6 +1358,112 @@ function HistoryTab({ s, patch }: TabProps) {
           </details>
         </div>
       ))}
+    </section>
+  );
+}
+
+// estado de cada linha da aba Áudios, pela chave `name`
+type AudioRow =
+  | { st: "transcrevendo" }
+  | { st: "ok"; texto: string; aviso: string | null }
+  | { st: "erro"; msg: string };
+
+function AudiosTab({ s, patch }: TabProps) {
+  const [audios, setAudios] = useState<AudioEntry[]>([]);
+  const [rows, setRows] = useState<Record<string, AudioRow>>({});
+  const [tocando, setTocando] = useState<{ name: string; url: string } | null>(null);
+
+  const load = useCallback(() => invoke<AudioEntry[]>("list_audios").then(setAudios), []);
+  useEffect(() => {
+    load();
+  }, [load]);
+  // prazo menor apaga arquivos ao salvar (debounce de 600ms): relê depois disso
+  const keepAnterior = useRef(s.audio_keep_days);
+  useEffect(() => {
+    if (keepAnterior.current === s.audio_keep_days) return;
+    keepAnterior.current = s.audio_keep_days;
+    const t = window.setTimeout(load, 1200);
+    return () => window.clearTimeout(t);
+  }, [s.audio_keep_days, load]);
+  // o object URL segura o WAV inteiro na memória até ser revogado
+  useEffect(() => () => {
+    if (tocando) URL.revokeObjectURL(tocando.url);
+  }, [tocando]);
+
+  const ouvir = async (name: string) => {
+    try {
+      const buf = await invoke<ArrayBuffer>("read_audio", { name });
+      setTocando({ name, url: URL.createObjectURL(new Blob([buf], { type: "audio/wav" })) });
+    } catch (e) {
+      setRows((r) => ({ ...r, [name]: { st: "erro", msg: `não abriu o áudio: ${String(e)}` } }));
+    }
+  };
+
+  const transcrever = async (name: string) => {
+    setRows((r) => ({ ...r, [name]: { st: "transcrevendo" } }));
+    try {
+      const res = await invoke<Retranscricao>("transcribe_audio", { name });
+      setRows((r) => ({ ...r, [name]: { st: "ok", texto: res.texto, aviso: res.aviso } }));
+    } catch (e) {
+      setRows((r) => ({ ...r, [name]: { st: "erro", msg: String(e) } }));
+    }
+    load();
+  };
+
+  return (
+    <section>
+      <h1>Áudios</h1>
+      <p className="hint">
+        Cada ditado fica guardado aqui, sem criptografia, enquanto "Salvar histórico localmente" estiver ligado.
+        Se a transcrição falhar, transcreva de novo: o texto vai para a área de transferência. Pelo ícone da
+        bandeja, "Transcrever último áudio" cola direto onde estiver o cursor.
+      </p>
+      <div className="history-controls">
+        <label className="field">
+          <span>Guardar por</span>
+          <select
+            value={s.audio_keep_days}
+            onChange={(e) => patch({ audio_keep_days: Number(e.target.value) })}
+          >
+            {[1, 3, 7, 15, 30].map((d) => (
+              <option key={d} value={d}>
+                {d} {d === 1 ? "dia" : "dias"}
+              </option>
+            ))}
+            <option value={0}>Não guardar</option>
+          </select>
+        </label>
+        <button onClick={() => invoke("open_audio_dir")}>Abrir pasta</button>
+      </div>
+      {audios.length === 0 && <p className="hint">Nenhum áudio guardado.</p>}
+      {audios.map((a) => {
+        const row = rows[a.name];
+        return (
+          <div key={a.name} className="card">
+            <div className="card-head">
+              <div className="card-title">
+                {new Date(a.ts * 1000).toLocaleString("pt-BR")} · {a.secs.toFixed(1)}s
+                {a.erro && <span className="audio-falhou"> · falhou</span>}
+              </div>
+              <button onClick={() => ouvir(a.name)}>▶ Ouvir</button>
+              <button disabled={row?.st === "transcrevendo"} onClick={() => transcrever(a.name)}>
+                {row?.st === "transcrevendo" ? "Transcrevendo..." : "Transcrever"}
+              </button>
+            </div>
+            {tocando?.name === a.name && <audio className="audio-player" src={tocando.url} controls autoPlay />}
+            {a.erro && row?.st !== "ok" && <div className="entry-raw">{a.erro}</div>}
+            {row?.st === "ok" && (
+              <>
+                <div className="entry-meta">
+                  copiado para a área de transferência{row.aviso ? ` · sem correção: ${row.aviso}` : ""}
+                </div>
+                <div className="entry-final">{row.texto}</div>
+              </>
+            )}
+            {row?.st === "erro" && <div className="audio-falhou">{row.msg}</div>}
+          </div>
+        );
+      })}
     </section>
   );
 }

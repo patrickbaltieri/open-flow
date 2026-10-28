@@ -25,6 +25,8 @@ reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
 arboard = "3"
 enigo = "0.6"
 dirs = "6"
+# hora local no nome do arquivo do perfil com pasta de saída (já estava na árvore)
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Sign in with ChatGPT: PKCE S256, aleatoriedade do sistema e base64url.
 # As tres ja estavam na arvore por outras dependencias; aqui so viram diretas.
 sha2 = "0.10"

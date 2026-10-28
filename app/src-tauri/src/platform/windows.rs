@@ -139,11 +139,32 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: usize, lparam: i
             let msg = wparam as u32;
             let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
             if down || msg == WM_KEYUP || msg == WM_SYSKEYUP {
-                HOOK_STATE.with(|s| {
-                    if let Some(st) = s.borrow_mut().as_mut() {
-                        handle_key(st, kb.vkCode, down);
-                    }
+                // (engolir, primeira descida, Win apertado)
+                let (engolir, primeira, win) = HOOK_STATE.with(|s| {
+                    let mut b = s.borrow_mut();
+                    let Some(st) = b.as_mut() else { return (false, false, false) };
+                    let primeira = down && !st.pressed.contains(&kb.vkCode);
+                    let win = st.pressed.contains(&0x5B) || st.pressed.contains(&0x5C);
+                    (handle_key(st, kb.vkCode, down), primeira, win)
                 });
+                if engolir {
+                    // A tecla comum do atalho (o F2 de Alt+F2) não chega ao app em
+                    // foco. Engolida ela, o Alt (ou o Win) solto depois pareceria
+                    // solto sozinho e abriria o menu do app (ou o Iniciar): uma
+                    // tecla neutra (vkE8, sem função) com o modificador ainda
+                    // apertado evita isso — a mesma técnica do gravador do TOMO e
+                    // do AutoHotkey. Só na primeira descida: a repetição automática
+                    // não precisa de outra. Fora do hook: injetar aqui dentro
+                    // atrasaria o callback, e o Windows remove hook lento.
+                    if primeira && (msg == WM_SYSKEYDOWN || win) {
+                        std::thread::spawn(|| {
+                            use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP};
+                            keybd_event(0xE8, 0, 0, 0);
+                            keybd_event(0xE8, 0, KEYEVENTF_KEYUP, 0);
+                        });
+                    }
+                    return 1;
+                }
             }
         }
     }
@@ -162,6 +183,8 @@ pub fn spawn_hotkey_listener(shared: Arc<Shared>, tx: Sender<Cmd>) {
                 pressed: HashSet::new(),
                 latched: None,
                 recording: None,
+                started_at: None,
+                engolidas: HashSet::new(),
             });
         });
         println!("[hotkey] instalando hook global...");

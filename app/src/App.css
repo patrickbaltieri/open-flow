@@ -544,6 +544,15 @@ button.link:hover {
   white-space: pre-wrap;
 }
 
+.audio-falhou {
+  color: var(--danger);
+}
+
+.audio-player {
+  width: 100%;
+  margin: 0.2rem 0 0.4rem;
+}
+
 .entry-raw {
   white-space: pre-wrap;
   color: var(--muted);
