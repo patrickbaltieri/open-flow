@@ -57,8 +57,10 @@ sai na máquina dele. Isso é a origem da maior parte da confusão histórica do
   segue no modelo antigo. Toda troca de modelo futura precisa desse passo nos dois lados.
 - **Fork (patrickbaltieri/open-flow, branch feat/audios, 2026-10-28)**: áudios guardados,
   atalho misto, perfil "Salvar para o laudo" (TOMO) e sidecar sem a `av` — ver
-  `docs/alteracoes-do-fork.md` itens 16 a 21. Buildado só no Windows (TDOOFFICE); o Mac e o
-  TDOSTUDIO ainda não têm. No macOS a tecla do atalho não é engolida.
+  `docs/alteracoes-do-fork.md` itens 16 a 22. Release `v0.1.15-pb1` no fork (só Windows),
+  instalada no TDOOFFICE e no TDOSTUDIO; o Mac ainda não tem. No macOS a tecla do atalho não
+  é engolida. Whisper local no venv do próprio app (`C:\PROJETOS\open-flow\.venv`), nunca no
+  do TOMO: o TOMO é que usa o sidecar do Open Flow.
 - **Fonte da verdade da versão**: `app/src-tauri/tauri.conf.json` (o `version` do
   `app/package.json` está em 0.1.0 e é ignorado — não é ele que nomeia os instaladores).
 

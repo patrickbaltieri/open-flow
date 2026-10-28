@@ -513,6 +513,42 @@ para as sessões, sem tocá-lo. Para ler o real, usar um terminal fora do sandbo
 
 ---
 
+## 22. Pasta dos ditados configurável e Whisper no venv do próprio app
+
+**Onde:** `ditados_dir` nas configurações (`ditados::dir`, arquivo-marca
+`.openflow-ditados`), campo "Pasta dos ditados" na aba Perfis.
+
+A pasta do item 20 virou configuração. Nos dois PCs ela aponta para
+`PROJETOS\APP\TOMO\ditados` no Dropbox: dita num PC, faz o laudo no outro. A
+limpeza por prazo só apaga numa pasta que tenha a marca `.openflow-ditados`,
+para nunca limpar uma pasta errada. Caminho relativo volta para o padrão, e
+`%VAR%` é expandido.
+
+O Open Flow é independente do TOMO: o TOMO usa o Whisper do Open Flow, e não o
+contrário. O sidecar roda no venv do próprio app, `C:\PROJETOS\open-flow\.venv`
+(o do README), e não mais no `C:\PROJETOS\TOMO-whisper\venv` do item 18, que foi
+apagado. As versões testadas são faster-whisper 1.2.1, ctranslate2 4.8.4, numpy
+2.5.4, nvidia-cublas-cu12 12.9.2.10 e nvidia-cudnn-cu12 9.27.0.42. O modelo fica no
+cache do Hugging Face. Quem cria o venv, baixa o modelo e aponta o
+`settings.json` é o `whisper-openflow.cmd` do pacote de instalação no Dropbox
+(`PROJETOS\APP\OpenFlow-instalar`). Na hora de testar, lembrar que o sidecar
+atende uma conexão por vez: uma sonda de porta que não fecha a conexão o deixa
+preso.
+
+**Contrato com o TOMO** (`tomo/ditado.py`). Mudou algum destes pontos, avisar o TOMO:
+- **Nomes:** `AAAA-MM-DD_HHMMSS.wav` e `.json` com o mesmo nome. O `.json` sai por último, por `.tmp` e rename.
+- **Campos que o TOMO lê:**
+  - `status`: diferente de `"ok"`, ele retranscreve;
+  - `raw`;
+  - `audio`: com `null`, ele usa só o texto;
+  - `audio_secs`: com ele, o TOMO trata o `.wav` como ainda sincronizando enquanto tiver menos de 0,9 × 32000 × `audio_secs` bytes;
+  - `erro`.
+- **WAV:** PCM 16 kHz, mono, 16 bits. O TOMO depende disso para a conta dos 32.000 bytes/s.
+- **Sidecar:** `POST /stt?lang=pt&beam=5&prompt=...`, com o WAV no corpo, devolvendo `text`, `model` e `device`.
+- **Pasta:** o TOMO nunca apaga nada nela. Quem limpa, depois de 7 dias, é o Open Flow.
+
+---
+
 ## Procedimento de merge
 
 1. `git fetch --tags origin` e ver o que mudou: `git log --oneline HEAD..origin/main`
