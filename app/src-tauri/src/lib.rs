@@ -12,6 +12,7 @@ use tauri::menu::{CheckMenuItem, Menu, MenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 
+mod insertion_queue;
 mod platform;
 mod siwc;
 
@@ -260,7 +261,6 @@ struct Shared {
     bindings: Mutex<Vec<Binding>>,
     cancel: Mutex<Option<u32>>,
     sidecar: Mutex<Option<std::process::Child>>,
-    insert_lock: Mutex<()>,
     /// preenchido no setup(); o hook de teclado precisa dele para trocar perfil e avisar na tela
     app: OnceLock<AppHandle>,
     /// último texto inserido: a colagem pode falhar sem erro (janela sem foco,
@@ -1296,6 +1296,10 @@ fn modelo_efetivo(configurado: &str) -> &str {
 /// medido, o corte em 2s deu máximo de 4,1s contra 10,0s do corte em 8s.
 /// 4s é o meio: acima do p95 real (~3,3s), então quase nenhuma chamada boa
 /// morre, e ainda mata o estol antes de o ditado virar prejuízo.
+/// Merge de 2026-10-28: o upstream (41839b1) subiu este teto para 8s e tirou a
+/// retentativa, medindo p90 de 5,85s no Gemini. O fork manteve 4s + retentativa
+/// porque tem teto por provedor (`timeout_secs`) e reescreve por outros provedores;
+/// rever com bench/bench_rewrite.py antes de adotar o número do upstream.
 const REWRITE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Err traz o status HTTP (0 = falha de rede, 408 = estourou o teto) para separar
@@ -1344,15 +1348,6 @@ fn rewrite_gemini(raw: &str, s: &Settings, profile: &str) -> Result<String, Stri
     let escolhido = modelo_efetivo(&s.gemini_model);
     match call_gemini(escolhido, &key, &prompt) {
         Ok(t) => Ok(t),
-        // Travada isolada do free tier: a segunda tentativa pega outra fila e
-        // costuma responder no tempo normal. Só cabe porque o teto caiu para
-        // REWRITE_TIMEOUT — com os 30s antigos a segunda chamada chegaria depois
-        // de o usuário já ter desistido. Uma tentativa só: duas somariam o dobro
-        // do teto.
-        Err((408, e)) => {
-            eprintln!("[gemini] estourou {}s ({e}); segunda tentativa", REWRITE_TIMEOUT.as_secs());
-            call_gemini(escolhido, &key, &prompt).map_err(|(_, e2)| e2)
-        }
         // Modelo fora do ar (404/503) ou cota do minuto estourada (429): o
         // fallback é outro modelo, logo outro balde de cota, então responde na
         // hora. Erro de rede não entra: erraria de novo.
@@ -1624,6 +1619,33 @@ enum Cmd {
 
 fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
     let (tx, rx) = channel::<Cmd>();
+    let (insert_tx, insert_rx) = channel();
+    let shared_insert = shared.clone();
+    let app_insert = app.clone();
+    std::thread::spawn(move || {
+        insertion_queue::consume_in_order(insert_rx, |gen, result| {
+            let result = result
+                .map_err(|_| "Processamento do ditado interrompido".to_string())
+                .and_then(|result: Result<(String, Option<String>), String>| result)
+                .and_then(|(text, aviso)| {
+                    // Preservar a recuperação pela bandeja mesmo se a colagem falhar.
+                    *shared_insert.last_text.lock().unwrap() = text.clone();
+                    insert_text(&text).map(|()| aviso)
+                });
+            match result {
+                // colou, mas sem reescrita: o texto é o bruto do Whisper
+                Ok(Some(motivo)) => {
+                    overlay_hide(&app_insert, gen);
+                    toast_show(&app_insert, &format!("texto sem correção — {motivo}"));
+                }
+                Ok(None) => overlay_hide(&app_insert, gen),
+                Err(e) => {
+                    eprintln!("[pipeline] erro: {e}");
+                    overlay_fail(&app_insert, gen, &e);
+                }
+            }
+        });
+    });
     std::thread::spawn(move || {
         let mut rec = Recorder::new();
         // perfil pedido pelo atalho que iniciou a gravação em curso
@@ -1679,8 +1701,13 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                     let s = shared.settings.lock().unwrap().clone();
                     let profile = forced_profile.unwrap_or_else(|| s.active_profile.clone());
                     let shared_w = shared.clone();
-                    let app_w = app.clone();
-                    let gen_w = gen;
+                    // Reservar a posição na thread de captura, antes de processar:
+                    // ordem de conclusão das APIs nunca decide a ordem da colagem.
+                    let (result_tx, result_rx) = channel();
+                    if insert_tx.send((gen, result_rx)).is_err() {
+                        overlay_fail(&app, gen, "Fila de inserção indisponível");
+                        continue;
+                    }
                     std::thread::spawn(move || {
                         let t0 = Instant::now();
                         let result = run_stt(wav_bytes(&samples, rate), &shared_w, &s)
@@ -1720,22 +1747,9 @@ fn spawn_pipeline(shared: Arc<Shared>, app: AppHandle) -> Sender<Cmd> {
                                         total_secs: total,
                                     });
                                 }
-                                *shared_w.last_text.lock().unwrap() = final_text.clone();
-                                let _serial = shared_w.insert_lock.lock().unwrap();
-                                insert_text(&final_text).map(|()| aviso)
+                                Ok((final_text, aviso))
                             });
-                        match result {
-                            // colou, mas sem reescrita: o texto é o bruto do Whisper
-                            Ok(Some(motivo)) => {
-                                overlay_hide(&app_w, gen_w);
-                                toast_show(&app_w, &format!("texto sem correção — {motivo}"));
-                            }
-                            Ok(None) => overlay_hide(&app_w, gen_w),
-                            Err(e) => {
-                                eprintln!("[pipeline] erro: {e}");
-                                overlay_fail(&app_w, gen_w, &e);
-                            }
-                        }
+                        let _ = result_tx.send(result);
                     });
                 }
                 Err(_) => break,
@@ -2369,7 +2383,6 @@ mod tests {
             cancel: Mutex::new(parse_cancel_key(cancel)),
             sidecar: Mutex::new(None),
             settings: Mutex::new(s),
-            insert_lock: Mutex::new(()),
             app: OnceLock::new(),
             last_text: Mutex::new(String::new()),
             overlay_gen: AtomicU64::new(0),
@@ -2464,7 +2477,6 @@ mod tests {
             cancel: Mutex::new(parse_cancel_key(&s.cancel_key)),
             sidecar: Mutex::new(None),
             settings: Mutex::new(s),
-            insert_lock: Mutex::new(()),
             app: OnceLock::new(),
             last_text: Mutex::new(String::new()),
             overlay_gen: AtomicU64::new(0),
@@ -2967,7 +2979,6 @@ pub fn run() {
         cancel: Mutex::new(parse_cancel_key(&settings.cancel_key)),
         sidecar: Mutex::new(if start_local { platform::spawn_sidecar(&settings) } else { None }),
         settings: Mutex::new(settings.clone()),
-        insert_lock: Mutex::new(()),
         app: OnceLock::new(),
         last_text: Mutex::new(String::new()),
         overlay_gen: AtomicU64::new(0),
